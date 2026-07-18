@@ -1,0 +1,13 @@
+packaging
+pytest
+litellm
+graphviz
+tiktoken
+numpy
+pandas
+openpyxl
+matplotlib
+seaborn
+scipy
+venn
+rich

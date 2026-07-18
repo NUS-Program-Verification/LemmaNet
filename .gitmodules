@@ -1,0 +1,6 @@
+[submodule "benchmarks/AutoRocq-bench"]
+	path = benchmarks/AutoRocq-bench
+	url = https://github.com/NUS-Program-Verification/AutoRocq-bench.git
+[submodule "benchmarks/ntp4vc"]
+	path = benchmarks/ntp4vc
+	url = https://github.com/zhaohuanqdcn/NTP4VC-Rocq8.18.git
