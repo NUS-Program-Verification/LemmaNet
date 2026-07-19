@@ -1,0 +1,29 @@
+{
+  "llm": {
+    "model": "openai/gpt-4.1",
+    "temperature": 0.0,
+    "max_tokens": 2000,
+    "timeout": 30,
+    "api_key": null,
+    "api_base": null,
+    "enable_caching": true
+  },
+  "coq": {
+    "timeout": 60,
+    "max_steps": 10,
+    "auto_setup_coqproject": true
+  },
+  "interactive": {
+    "enabled": false
+  },
+  "ablation": {
+    "enable_recording": true,
+    "enable_error_feedback": true,
+    "enable_context_search": true,
+    "enable_helper_lemma": false,
+    "max_context_search": 3,
+    "max_errors": 3
+  },
+  "log_level": "INFO",
+  "output_dir": null
+}

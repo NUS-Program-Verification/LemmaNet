@@ -13,7 +13,7 @@ SCRIPT_DIR = Path(__file__).parent
 AUTOROCQ_DIR = SCRIPT_DIR.parent
 LEMMA_DIR = AUTOROCQ_DIR / "offline-lemma"
 BENCHMARKS_DIR = AUTOROCQ_DIR / "benchmarks"
-NTP4VC_SRC_BASE = AUTOROCQ_DIR / "source_programs" / "ntp4vc"
+NTP4VC_SRC_BASE = BENCHMARKS_DIR / "ntp4vc"
 PROOF_SEARCH_DIR = AUTOROCQ_DIR / "proof-search"
 SHARED_CONFIG_FILE = PROOF_SEARCH_DIR / "configs" / "local.json"
 
@@ -788,11 +788,12 @@ def process_proof(
         source_file = source_file_meta
     elif source_file_meta.startswith('source_programs/'):
         # Relative path (report.json)
-        source_file = str(AUTOROCQ_DIR / source_file_meta)
+        source_file = str(BENCHMARKS_DIR / "AutoRocq-bench" / source_file_meta)
     
     # If source_file not found yet, search in source_base
     if not source_file or not os.path.exists(source_file):
         if not source_base:
+            print(f"Error: source base not found: {source_base}")
             return False
         
         # Extract project name from v_file path
