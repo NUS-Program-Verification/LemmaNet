@@ -8,7 +8,7 @@ from agent.proof_tree import ProofTree
 from agent import visualizer
 from utils.recorder import create_proof_recorder
 from utils.logger import clean_ansi_codes, setup_logger
-from utils.coq_utils import hints_from_error, goal_diff
+from utils.coq_utils import hints_from_error, goal_diff, extract_theorem_name
 from utils.config import InteractiveConfig
 
 class ProofController:
@@ -212,13 +212,29 @@ class ProofController:
     ##  Proof methods  ##
     #####################
 
+    def _detect_theorem_name(self) -> str:
+        """
+        Name of the theorem about to be proved, read from its statement in the
+        Coq file. Used when the caller did not supply one, so that recorded
+        tactics and helper lemmas keep their provenance instead of 'unnamed'.
+        """
+        proof = self.coq.get_unproven_proof()
+        if not proof:
+            return ""
+        name = extract_theorem_name(proof.text)
+        if name:
+            self.logger.info(f"📛 Detected theorem name: {name}")
+        else:
+            self.logger.warning(f"⚠️  Could not read a theorem name from: {proof.text[:60]}")
+        return name
+
     def _init_proof_session(self, theorem_name: str = None) -> bool:
         """
         Initialize all state for a new proof attempt.
         Called by both prove_theorem() and InteractiveSessionManager.
         Returns False if initialization fails (e.g., no unproven proof found).
         """
-        self.current_theorem_name = theorem_name or 'unnamed'
+        self.current_theorem_name = theorem_name or self._detect_theorem_name() or 'unnamed'
         self.logger.info(f"🚀 Starting proof for: {self.current_theorem_name}")
         self.logger.info(f"⚙️  Max steps: {self.max_steps}")
 
@@ -733,24 +749,33 @@ class ProofController:
                     tactic_with_state['source'] = 'agent'
                     self._tactics_with_states.append(tactic_with_state)
 
-                    # Update history with successful sub-proof (helper lemma)
-                    # Walk backwards: collect tactics inside { ... }, then find assert before {
-                    hl_tactics_with_states = []
-                    assert_tactic_state = None
-                    for tw in self._tactics_with_states[::-1]:
-                        if tw['tactic'] == '{':
-                            break
-                        hl_tactics_with_states.append(tw)
-                    hl_tactics_with_states.reverse()
-
-                    # The assert statement is right before '{'
+                    # Update history with successful sub-proof (helper lemma).
+                    # Walk backwards to the '{' that opened this sub-proof,
+                    # stepping over any nested '{ ... }' pair on the way. A plain
+                    # "stop at the first '{'" scan would stop inside a helper
+                    # lemma proved within this one, and record that inner assert
+                    # against the tail of this proof.
                     brace_idx = None
-                    for idx in range(len(self._tactics_with_states) - 1, -1, -1):
-                        if self._tactics_with_states[idx]['tactic'] == '{':
-                            brace_idx = idx
-                            break
-                    if brace_idx is not None and brace_idx > 0:
-                        assert_tactic_state = self._tactics_with_states[brace_idx - 1]
+                    nested = 0
+                    for idx in range(len(self._tactics_with_states) - 2, -1, -1):  # skip the '}' just added
+                        tactic = self._tactics_with_states[idx]['tactic'].strip()
+                        if tactic == '}':
+                            nested += 1
+                        elif tactic == '{':
+                            if nested == 0:
+                                brace_idx = idx
+                                break
+                            nested -= 1
+
+                    # Everything between '{' and the closing '}' is this lemma's
+                    # proof, and the assert statement is right before '{'
+                    hl_tactics_with_states = (
+                        self._tactics_with_states[brace_idx + 1:] if brace_idx is not None else []
+                    )
+                    assert_tactic_state = (
+                        self._tactics_with_states[brace_idx - 1]
+                        if brace_idx is not None and brace_idx > 0 else None
+                    )
 
                     # Record the complete helper lemma as a reusable unit
                     if assert_tactic_state is not None:

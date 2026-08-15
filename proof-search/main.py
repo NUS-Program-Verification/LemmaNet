@@ -167,7 +167,9 @@ def setup_output_directory(output_dir: Optional[str]) -> Path:
 def initialize_components(args, config: ProofAgentConfig, logger) -> Dict[str, Any]:
     """Initialize all proof agent components."""
     logger.info("Initializing proof agent components...")
-    
+
+    coq_interface = None
+
     try:
         # Process library paths from command line
         library_paths = getattr(config.coq, 'library_paths', [])
@@ -218,9 +220,9 @@ def initialize_components(args, config: ProofAgentConfig, logger) -> Dict[str, A
         # Load the file using proper method
         success = coq_interface.load()
         if not success:
-            error_msg = coq_interface.get_last_error()
+            error_msg = coq_interface.get_last_error() or "unknown error"
             logger.error(f"❌ {error_msg}")
-            raise Exception(f"Failed to load Coq file")
+            raise Exception(f"Failed to load Coq file: {error_msg}")
         
         logger.info("✅ File loaded successfully")
         
@@ -291,6 +293,15 @@ def initialize_components(args, config: ProofAgentConfig, logger) -> Dict[str, A
         logger.error(f"Failed to initialize components: {e}")
         import traceback
         traceback.print_exc()
+        # main()'s cleanup only sees the components dict we never returned, so
+        # close the coq-lsp subprocess here or the process hangs.
+        if coq_interface is not None:
+            logger.info("Closing Coq interface after failed initialization...")
+            try:
+                coq_interface.close()
+            except Exception as close_error:
+                logger.warning(f"Error closing Coq interface: {close_error}")
+                coq_interface.force_close()
         raise
 
 
@@ -738,6 +749,11 @@ def main():
         else:
             logger.warning("❌ Proof incomplete")
             exit_code = 1
+
+        # Success logs at INFO, failure at WARNING, so a quiet level showed only
+        # failures. Mirror the outcome when the logger stayed silent.
+        if logger.getEffectiveLevel() > (logging.INFO if result else logging.WARNING):
+            print("🎉 Proof completed successfully!" if result else "❌ Proof incomplete")
             
     except Exception as e:
         logger.error(f"❌ Error during proof attempt: {e}")

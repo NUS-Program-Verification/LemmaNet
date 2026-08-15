@@ -96,6 +96,8 @@ class InteractiveSessionManager:
                 self._do_user_tactic(tactic, silent=True)
                 if self._done:
                     break
+            # Replayed braces may leave us inside a sub-proof; resync the stack.
+            self.controller._refresh_helper_lemma_stack_from_history()
 
         self._display_state()
         if not self._done:
@@ -197,7 +199,8 @@ class InteractiveSessionManager:
             print("Usage: tactic <tactic_string>")
             return
 
-        if not tactic.endswith('.'):
+        # Braces are steps in their own right and take no period.
+        if not tactic.endswith('.') and tactic not in ('{', '}'):
             tactic += '.'
 
         subgoals_before = self.controller.coq.get_subgoals()
@@ -248,24 +251,30 @@ class InteractiveSessionManager:
             brace_state['source'] = 'user'
             self.controller._tactics_with_states.append(brace_state)
 
-            # Update history with successful sub-proof (helper lemma)
-            # Walk backwards: collect tactics inside { ... }, then find assert before {
-            hl_tactics_with_states = []
-            assert_tactic_state = None
-            for tw in self.controller._tactics_with_states[::-1]:
-                if tw['tactic'] == '{':
-                    break
-                hl_tactics_with_states.append(tw)
-            hl_tactics_with_states.reverse()
-
-            # The assert statement is right before '{'
+            # Update history with successful sub-proof (helper lemma).
+            # Walk backwards to the '{' that opened this sub-proof, stepping over
+            # any nested '{ ... }' pair on the way. A plain "stop at the first
+            # '{'" scan would stop inside a helper lemma proved within this one,
+            # and record that inner assert against the tail of this proof.
+            states = self.controller._tactics_with_states
             brace_idx = None
-            for idx in range(len(self.controller._tactics_with_states) - 1, -1, -1):
-                if self.controller._tactics_with_states[idx]['tactic'] == '{':
-                    brace_idx = idx
-                    break
-            if brace_idx is not None and brace_idx > 0:
-                assert_tactic_state = self.controller._tactics_with_states[brace_idx - 1]
+            nested = 0
+            for idx in range(len(states) - 2, -1, -1):  # skip the '}' just added
+                tactic = states[idx]['tactic'].strip()
+                if tactic == '}':
+                    nested += 1
+                elif tactic == '{':
+                    if nested == 0:
+                        brace_idx = idx
+                        break
+                    nested -= 1
+
+            # Everything between '{' and the closing '}' is this lemma's proof,
+            # and the assert statement is right before '{'
+            hl_tactics_with_states = states[brace_idx + 1:] if brace_idx is not None else []
+            assert_tactic_state = (
+                states[brace_idx - 1] if brace_idx is not None and brace_idx > 0 else None
+            )
 
             # Record the complete helper lemma as a reusable unit
             if assert_tactic_state is not None:
@@ -297,25 +306,30 @@ class InteractiveSessionManager:
         if actual_n < n:
             print(f"Warning: only {len(history)} tactic(s) applied; rolling back all.")
 
-        remaining = history[:-actual_n]
-        target_step_number = remaining[-1]['step_number'] if remaining else 0
+        # Via the controller, so landing on a lemma's '{' also drops its assert.
+        proof_tree_str = (
+            self.controller.proof_tree.get_proof_tree_string()
+            if self.controller.proof_tree is not None else ''
+        )
+        result = self.controller._execute_rollback(
+            history, reason='User rollback', proof_tree_str=proof_tree_str, rb_steps=actual_n
+        )
+        if not result['success']:
+            print(f"Rollback failed: {result['message']}")
+            return
 
-        # Pop steps from CoqPyt
-        proof = self.controller.coq.get_unproven_proof()
-        if proof:
-            for _ in range(actual_n):
-                self.controller.coq.proof_file.pop_step(proof)
-        self.controller.coq.proof = self.controller.coq.get_unproven_proof()
-
-        # Update proof tree
-        if self.controller.proof_tree is not None:
-            self.controller.proof_tree.delete_subtree_by_step_number(target_step_number)
-
-        self.controller._tactics_with_states[:] = remaining
+        target_step_number = result['target_step_number']
+        if result['target_index'] > 0:
+            self.controller._tactics_with_states[:] = [
+                t for t in self.controller._tactics_with_states
+                if t['step_number'] <= target_step_number
+            ]
+        else:
+            self.controller._tactics_with_states[:] = []
         self.controller._refresh_helper_lemma_stack_from_history()
 
-        self.logger.debug(f"User rollback: {actual_n} tactic(s)")
-        print(f"Rolled back {actual_n} tactic(s).")
+        self.logger.debug(f"User rollback: {result['rollback_distance']} tactic(s)")
+        print(f"Rolled back {result['rollback_distance']} tactic(s).")
         self._display_state()
 
     def _do_search(self, cmd: str):
@@ -393,19 +407,16 @@ class InteractiveSessionManager:
         print(visualizer.render_state(goals))
 
     def _report(self, result):
+        # step_generator() already renders each action; only add what it omits.
         t = result.get('type')
         if t == 'tactic':
-            tactic = result.get('tactic', '?')
-            success = result.get('success', False)
-            print(visualizer.render_action('tactic', tactic, success), end='')
-            if success and result.get('proof_complete'):
-                print("🎉 Proof complete!")
-            elif not success:
+            if result.get('success'):
+                if result.get('proof_complete'):
+                    print("🎉 Proof complete!")
+            else:
                 print(f"  — {result.get('error', '')}")
         elif t == 'rollback':
-            if result.get('success'):
-                print(f"Agent rolled back {result.get('distance', '?')} step(s).")
-            else:
+            if not result.get('success'):
                 print("Agent rollback failed.")
         elif t == 'done':
             if result.get('success'):
