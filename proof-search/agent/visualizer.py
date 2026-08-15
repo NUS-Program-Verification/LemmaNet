@@ -10,6 +10,7 @@ Internal logging (through utils.logger) and LLM conversation does not go through
 """
 
 import re
+import sys
 from typing import Any, Dict, List, Optional
 
 try:
@@ -230,7 +231,9 @@ def _rich_box(body: str, title: str) -> str:
     from rich.panel import Panel as _Panel
 
     buf = StringIO()
-    c = _Console(file=buf, highlight=False, markup=False)
+    # Rich decides on colour from the file it writes to, and a StringIO is never
+    # a terminal, so ask the real stdout instead or every style is stripped.
+    c = _Console(file=buf, highlight=False, markup=False, force_terminal=sys.stdout.isatty())
     c.print(_Panel(body, title=title, expand=False))
     return buf.getvalue()
 
@@ -240,7 +243,7 @@ def _rich_action(action_type: str, content: Any, success: bool) -> str:
     from rich.panel import Panel as _Panel
 
     buf = StringIO()
-    c = _Console(file=buf, highlight=False, markup=True)
+    c = _Console(file=buf, highlight=False, markup=True, force_terminal=sys.stdout.isatty())
 
     if action_type == "plan":
         c.print(_Panel(str(content), title="[bold blue]Plan[/bold blue]", expand=False))

@@ -400,6 +400,22 @@ def generate_helper_lemma_name(statement: str) -> str:
     return 'Hlemma'
 
 
+_THEOREM_HEADER_RE = re.compile(
+    r"^\s*(?:#\[[^\]]*\]\s*)?(?:Local\s+|Global\s+|Program\s+)*"
+    r"(?:Theorem|Lemma|Corollary|Proposition|Fact|Remark|Property|Definition|Example|Instance)"
+    r"\s+([A-Za-z_][A-Za-z0-9_']*)"
+)
+
+
+def extract_theorem_name(statement: str) -> str:
+    """
+    Name declared by a Coq theorem statement, e.g. 'wp_goal' for
+    'Theorem wp_goal : ...'. Returns '' for anonymous forms such as 'Goal'.
+    """
+    match = _THEOREM_HEADER_RE.match(statement or "")
+    return match.group(1) if match else ""
+
+
 # Coq built-in identifiers to filter out when extracting dependencies
 COQ_BUILTINS = {
     'forall', 'fun', 'Prop', 'Type', 'Z', 'Numbers', 'BinNums', 'Datatypes',
