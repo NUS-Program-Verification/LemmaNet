@@ -4,6 +4,8 @@
 
 **Paper**: [ASE 2026](https://arxiv.org/pdf/2603.22114)
 
+**Quick Links**: [Start with Docker](#quickstart-docker) | [How lemma discovery works](#how-lemma-discovery-works) | [Interactive mode](#interactive-mode)
+
 ---
 
 
@@ -24,43 +26,99 @@ while not coq.is_proof_complete():
     goal.update()
 ``` 
 
+This allows LemmaNet to prove more VCs faster:
+
+| Benchmark | CoqHammer | AutoRocq | **LemmaNet** |
+| --- | --- | --- | --- |
+| [SV-COMP](https://github.com/NUS-Program-Verification/AutoRocq-bench) | 13.3% | 38.5% | **46.5%** |
+| [NTP4VC](https://github.com/xqyww123/NTP4VC)  | 12.7% | 13.3% | **22.0%** |
+
+Reported numbers are percentage of VCs proved with GPT-5.2. 
+
+NTP4VC VCs come from real-world code — the Linux kernel, the C++ stdlib, Contiki OS, an X.509 parser, etc.
+
+Per-goal results and ablations are in [`eval/final/`](eval/final/); 
+see the [paper](https://arxiv.org/pdf/2603.22114) for the full setup.
+
+
 ---
 
-### Directory Structure
+### How Lemma Discovery Works
 
-```
-eval/                              # Directory for eval results
-└── final/                         # Final evluation results
+Take `match_string` from the Linux kernel ([`examples/match_string.c`](proof-search/examples/match_string.c)), annotated with a loop invariant and an assertion:
 
-benchmark/                         # Directory for benchmark VCs 
-├── ntp4vc/                        # NTP4VC (submodule)
-├── AutoRocq-bench/                # SV-COMP and more (submodule)
-└── *.txt                          # List of VC names used in evaluation
-
-offline-lemma/                     # Directory for offline synthesizer src
-└── lemma_discovery.py             # Main script
-
-proof-search/                      # Directory of proof agent src
-├── main.py                        # Entry point
-├── agent/                         
-│   ├── proof_controller.py        # Main loop
-│   ├── context_manager.py         # LLM interaction and context management
-│   ├── context_search.py          # Local context search
-│   ├── history_recorder.py        # Manages proof histories
-│   ├── proof_tree.py              # Manages proof tree
-│   └── interactive_session.py     # Interactive REPL loop
-├── backend/                       # Interface with CoqPyt
-├── coqpyt/                        # Interact with Coq
-└── utils/                         # Helper functions
-
-scripts/                           # Directory of scripts
-├── analyze/                       # Analysis scripts of final results
-├── run_discovery.py               # Batch offline lemma generation
-├── run.py                         # Batch run
-└── get_results.py                 # Parser of .json results
+```c
+/*@ loop invariant \forall size_t k;
+       0 <= k < index ==> valid_str(array[k]);
+ */
+for (index = 0; index < n; index++) {
+    item = array[index];
+    if (!item) break;
+    //@ assert valid_str(array[index]);
 ```
 
-### Setup Instructions
+Frama-C/WP discharges this into a Rocq VC where `valid_str` has become an opaque predicate `P_valid_str` over WP's memory model, the array access has become `t2 (shift a i)`, and the invariant is quantified over `0 <= k < i + 1`. 
+The connection to the assertion is obvious to a human and invisible to `lia` or a hammer.
+
+The offline stage reads the C source *and* the VC together, and synthesizes the bridge ([`examples/match_string_assert.v`](proof-search/examples/match_string_assert.v)):
+
+```coq
+Lemma assert_P_valid_str_at_index :
+  forall (t : Z -> Z) (t1 : addr -> Z) (t2 : addr -> addr) (a : addr) (i : Z),
+    0 <= i ->
+    (forall k : Z, 0 <= k < i + 1 -> P_valid_str t t1 (t2 (shift a k))) ->
+    P_valid_str t t1 (t2 (shift a i)).
+Proof.
+  intros t t1 t2 a i Hi Hinv.
+  apply Hinv; lia.
+Qed.
+```
+
+The lemma is trivial once stated — the difficulty is *stating* it, which requires knowing that the assertion at `index` is the loop invariant instantiated at `k = index`. 
+That is the information recoverable from the source but erased by the VC generator. 
+The online stage then proposes further lemmas during search, and proved lemmas are cached and replayed across goals.
+
+To reproduce this example yourself, follow the [quickstart guide](#quickstart-docker) and run the offline synthesizer on the same pair of files:
+
+```bash
+python3 offline-lemma/lemma_discovery.py \
+  --source ./proof-search/examples/match_string.c \
+  --wp-goal ./proof-search/examples/match_string_assert.v \
+  --output-dir ./temp
+```
+
+This will take one or two minutes. After completion, you will find the generated files saved in `temp/`:
+```bash
+- ghost_vc.v                  # An intuitive encoding of the VC
+- ghost_vc_helper_lemmas.v    # offline helper lemmas
+- proof_plan.txt              # Natural language proof plan
+- ghost_vc_log.txt            # Saved log
+```
+
+---
+
+## Getting Started
+
+Either path below leaves you able to run [your first proof](#proving-your-first-goal). 
+Every command that calls an LLM needs an API key — set it in the config or with `export OPENAI_API_KEY=...`. 
+For models from other providers, see the [config readme](proof-search/configs/readme.md).
+
+### Quickstart (Docker)
+
+The image pins Rocq 8.18.0 and the full `opam switch`, so you do not need a local OCaml/Rocq toolchain:
+
+```bash
+docker build -t lemmanet -f dockerfile/agent.dockerfile .
+```
+
+```bash
+docker run -it --rm -e OPENAI_API_KEY="sk-xxx" lemmanet
+```
+
+You land in `/LemmaNet/proof-search` with `libautorocq` already built and `configs/default_config.json` already pointing at it, so you can skip straight to proving. 
+To work on your own files, mount them with `-v "$PWD:/work"`.
+
+### Local Installation
 
 1. Install dependencies in Python
 
@@ -88,11 +146,9 @@ cd benchmarks/AutoRocq-bench/libautorocq; make
 
 5. Configure `library_paths` in `proof-search/configs/default_config.json` to point to `libautorocq`.
 
-### Minimal Example of Proof Agent
+### Proving Your First Goal
 
-1. Set up API key in the config or by running `export OPENAI_API_KEY=...`. If you prefer models from other providers, see [here](proof-search/configs/readme.md).
-
-2. To prove [`examples/example.v`](proof-search/examples/example.v) with a minimal [config](proof-search/configs/minimal.json), go to `proof-search` directory and run:
+From the `proof-search` directory, prove [`examples/example.v`](proof-search/examples/example.v) with the minimal [config](proof-search/configs/minimal.json):
 
 ```bash
 python3 -m main examples/example.v --config ./configs/minimal.json
@@ -106,30 +162,67 @@ and the proof script is saved in the same [`example.v`](proof-search/examples/ex
 
 For more configurations of the tool, check out the [readme](proof-search/configs/readme.md) or run with `--help` for more options.
 
+---
 
-### Minimal Example of Lemma Generation
+### Interactive Mode
 
-To prove generate offline helper lemmas for [`examples/match_string_assert.v`](proof-search/proof-search/examples/match_string_assert.v), run the following:
+
+
+In addition to running LemmaNet in a hands-off style, you can *co-develop* Rocq proofs with the agent in interactive mode.
+The agent exposes a REPL where you can steer, inspect, and contribute tactics alongside the LLM.
+
+**Starting interactive mode** — pass `--interactive` (or `-i`) on the command line:
 
 ```bash
-export OPENAI_API_KEY="sk-xxx"
-python3 offline-lemma/lemma_discovery.py \
-  --source ./proof-search/examples/match_string.c \
-  --wp-goal ./proof-search/examples/match_string_assert.v \
-  --output-dir ./temp
+python3 -m main examples/example.v --config ./configs/minimal.json --interactive
 ```
 
-This will take one or two minutes. After completion, you will find the generated files saved in `temp/`:
-```bash
-- ghost_vc.v                  # An intuitive encoding of the VC
-- ghost_vc_helper_lemmas.v    # offline helper lemmas
-- proof_plan.txt              # Natural language proof plan
-- ghost_vc_log.txt            # Saved log
+Or enable it permanently in your config:
+
+```json
+{
+  "interactive": {
+    "enabled": true
+  }
+}
 ```
+
+**What interactive mode does**
+
+- **Stepping through proofs** — you can step through LemmaNet's generation and understand its trajectory.
+- **Adding hints for agent** — You can add natural language `hint` to guide LemmaNet's proof strategy.
+- **Co-writing proofs** — you can directly add `tactic`, print `tree`, run `search`, or `rollback` as you wish. Existing proof steps and manual edits are preserved, LemmaNet picks up exactly where you left.
+- **Proposing helper lemmas** — you can introduce your own helper lemma with `lemma`, and `drop` a sub-proof that is not working out. User-proposed and agent-proposed lemmas go through the same path, so yours are cached and replayed just the same.
+
+#### REPL commands
+
+| Command        | Description                                                                                                                                                                                     |
+| -------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `step`         | Agent takes one action (tactic attempt or rollback), then pauses                                                                                                                                |
+| `run`          | Agent runs until the focused goal changes, the agent rolls back, or the proof completes. Failed tactics are handled internally and do not stop `run`                                            |
+| `tactic <tac>` | Apply a Rocq tactic directly (bypasses the LLM). Example: `tactic intros n.`                                                                                                                    |
+| `lemma <stmt>` | Introduce a helper lemma and enter its sub-proof. Name it explicitly (`lemma Hpos: 0 <= n`) or let one be generated (`lemma 0 <= n`). If the same lemma was proved before, its cached proof is replayed and the sub-proof closes immediately. Disabled when `ablation.enable_helper_lemma` is `false` |
+| `drop`         | Abandon the current helper lemma sub-proof, removing its `assert` and every tactic tried inside it, and return to the parent goal untouched                                                     |
+| `admit`        | Admit the current helper lemma sub-proof to move on. The admitted lemma is *not* recorded, and the enclosing proof can no longer be closed with `Qed` until it is dropped or rolled back        |
+| `hint <text>`  | Inject a natural-language hint into the agent's next prompt. Example: `hint try induction on n`                                                                                                 |
+| `rollback [n]` | Undo the last `n` applied tactics (default 1), regardless of whether they were applied by you or the agent. A rollback landing on a helper lemma's `{` removes its `assert` too. If `n` exceeds the number of applied tactics, rolls back to `Proof.` with a warning |
+| `search <cmd>` | Run a Rocq query and print the results (display-only; does not inject into LLM context). Examples: `search Search Z.add`, `search Print Z.add_comm`, `search Check Z.add`                       |
+| `status`       | Display the current proof goal and hypotheses. Inside a helper lemma, the sub-proof being proved is shown above the goal                                                                        |
+| `explain`      | Show agent reasoning history, including the last helper lemma proposed and the agent's stated purpose for it                                                                                    |
+| `tree`         | Display the current proof tree with tactic history; helper lemma sub-proofs are marked                                                                                                          |
+| `help`         | Print all available commands                                                                                                                                                                    |
+| `quit`         | Exit the session                                                                                                                                                                                |
+
+While a helper lemma sub-proof is open, the prompt shows which lemma you are proving — `lemmanet[Hpos]>`, or `lemmanet[Hinner @2]>` when nested.
 
 ---
 
-### Rerunning Large Experiments
+### Reproducing the Paper
+
+<details> 
+<summary><b>Reproducing Key Experiments</b></summary>
+
+<br>
 
 The paper's results can be reproduced by running all two benchmarks: `svcomp-ablation`, `svcomp-remaining`, `ntp4vc-ablation`, `ntp4vc-remaining`. 
 The list of VCs included in each benchmark can be found in `benchmarks/*.txt`.
@@ -168,7 +261,6 @@ done
 3. Build and generate configs
 
 ```bash
-export OPENAI_API_KEY="sk-xxx"
 python3 scripts/ntp4vc/build.py
 ```
 
@@ -181,7 +273,6 @@ To batch run large experiments on these benchmarks:
 1. Invoke the offline lemma discovery routine to prepare offline lemmas and proof plans:
 
 ```bash
-export OPENAI_API_KEY="sk-xxx"
 python3 scripts/run_discovery.py \
   --benchmark svcomp-ablation \
   --max-items 10
@@ -190,7 +281,6 @@ python3 scripts/run_discovery.py \
 2. Run the proof agent with prepared helper lemmas:
 
 ```bash
-export OPENAI_API_KEY="sk-xxx"
 python3 scripts/run.py \
   --benchmark svcomp-ablation \
   --output-dir ./out \
@@ -199,67 +289,7 @@ python3 scripts/run.py \
 
 Here, CLI flag `--max-items` limits the number of items to run in the benchmark (first 10 in this case).
 
----
-
-### Interactive Mode
-
-<details> 
-<summary><b>Details</b></summary>
-
-<br>
-
-In addition to running AutoRocq in a hands-off style, you can *co-develop* Rocq proofs with the agent in interactive mode.
-The agent exposes a REPL where you can steer, inspect, and contribute tactics alongside the LLM.
-
-**Starting interactive mode** — pass `--interactive` (or `-i`) on the command line:
-
-```bash
-python3 -m main examples/example.v --config ./configs/minimal.json --interactive
-```
-
-Or enable it permanently in your config:
-
-```json
-{
-  "interactive": {
-    "enabled": true
-  }
-}
-```
-
-**What interactive mode does**
-
-- **Stepping through proofs** — you can step through AutoRocq's generation and understand its trajectory.
-- **Adding hints for agent** — You can add natural language `hint` to guide AutoRocq's proof strategy.
-- **Co-writing proofs** — you can directly add `tactic`, print `tree`, run `search`, or `rollback` as you wish. Existing proof steps and manual edits are preserved, AutoRocq picks up exactly where you left.
-- **Proposing helper lemmas** — you can introduce your own helper lemma with `lemma`, and `drop` a sub-proof that is not working out. User-proposed and agent-proposed lemmas go through the same path, so yours are cached and replayed just the same.
-
-#### REPL commands
-
-| Command        | Description                                                                                                                                                                                     |
-| -------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `step`         | Agent takes one action (tactic attempt or rollback), then pauses                                                                                                                                |
-| `run`          | Agent runs until the focused goal changes, the agent rolls back, or the proof completes. Failed tactics are handled internally and do not stop `run`                                            |
-| `tactic <tac>` | Apply a Rocq tactic directly (bypasses the LLM). Example: `tactic intros n.`                                                                                                                    |
-| `lemma <stmt>` | Introduce a helper lemma and enter its sub-proof. Name it explicitly (`lemma Hpos: 0 <= n`) or let one be generated (`lemma 0 <= n`). If the same lemma was proved before, its cached proof is replayed and the sub-proof closes immediately. Disabled when `ablation.enable_helper_lemma` is `false` |
-| `drop`         | Abandon the current helper lemma sub-proof, removing its `assert` and every tactic tried inside it, and return to the parent goal untouched                                                     |
-| `admit`        | Admit the current helper lemma sub-proof to move on. The admitted lemma is *not* recorded, and the enclosing proof can no longer be closed with `Qed` until it is dropped or rolled back        |
-| `hint <text>`  | Inject a natural-language hint into the agent's next prompt. Example: `hint try induction on n`                                                                                                 |
-| `rollback [n]` | Undo the last `n` applied tactics (default 1), regardless of whether they were applied by you or the agent. A rollback landing on a helper lemma's `{` removes its `assert` too. If `n` exceeds the number of applied tactics, rolls back to `Proof.` with a warning |
-| `search <cmd>` | Run a Rocq query and print the results (display-only; does not inject into LLM context). Examples: `search Search Z.add`, `search Print Z.add_comm`, `search Check Z.add`                       |
-| `status`       | Display the current proof goal and hypotheses. Inside a helper lemma, the sub-proof being proved is shown above the goal                                                                        |
-| `explain`      | Show agent reasoning history, including the last helper lemma proposed and the agent's stated purpose for it                                                                                    |
-| `tree`         | Display the current proof tree with tactic history; helper lemma sub-proofs are marked                                                                                                          |
-| `help`         | Print all available commands                                                                                                                                                                    |
-| `quit`         | Exit the session                                                                                                                                                                                |
-
-While a helper lemma sub-proof is open, the prompt shows which lemma you are proving — `lemmanet[Hpos]>`, or `lemmanet[Hinner @2]>` when nested.
-
 </details> 
-
----
-
-### Replicating Results from Paper
 
 <details> 
 <summary><b>Reproducing Figures</b></summary>
@@ -288,6 +318,42 @@ python3 scripts/analyze/classify_lemma_names.py
 ```
 
 </details> 
+
+---
+
+### Directory Structure
+
+```
+eval/                              # Directory for eval results
+└── final/                         # Final evluation results
+
+benchmark/                         # Directory for benchmark VCs 
+├── ntp4vc/                        # NTP4VC (submodule)
+├── AutoRocq-bench/                # SV-COMP and more (submodule)
+└── *.txt                          # List of VC names used in evaluation
+
+offline-lemma/                     # Directory for offline synthesizer src
+└── lemma_discovery.py             # Main script
+
+proof-search/                      # Directory of proof agent src
+├── main.py                        # Entry point
+├── agent/                         
+│   ├── proof_controller.py        # Main loop
+│   ├── context_manager.py         # LLM interaction and context management
+│   ├── context_search.py          # Local context search
+│   ├── history_recorder.py        # Manages proof histories
+│   ├── proof_tree.py              # Manages proof tree
+│   └── interactive_session.py     # Interactive REPL loop
+├── backend/                       # Interface with CoqPyt
+├── coqpyt/                        # Interact with Coq
+└── utils/                         # Helper functions
+
+scripts/                           # Directory of scripts
+├── analyze/                       # Analysis scripts of final results
+├── run_discovery.py               # Batch offline lemma generation
+├── run.py                         # Batch run
+└── get_results.py                 # Parser of .json results
+```
 
 ---
 
