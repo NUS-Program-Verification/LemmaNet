@@ -96,9 +96,7 @@ class InteractiveSessionManager:
                 self._do_user_tactic(tactic, silent=True)
                 if self._done:
                     break
-            # Replayed braces put us back inside whatever helper lemma sub-proof
-            # the file was left in, so the stack has to match before the REPL
-            # starts — otherwise the sub-proof can never be closed.
+            # Replayed braces may leave us inside a sub-proof; resync the stack.
             self.controller._refresh_helper_lemma_stack_from_history()
 
         self._display_state()
@@ -201,9 +199,7 @@ class InteractiveSessionManager:
             print("Usage: tactic <tactic_string>")
             return
 
-        # Braces are steps in their own right and take no period; replaying a
-        # partial proof left inside a helper lemma feeds them through here, and
-        # appending '.' turns them into '{.' which Coq rejects.
+        # Braces are steps in their own right and take no period.
         if not tactic.endswith('.') and tactic not in ('{', '}'):
             tactic += '.'
 
@@ -310,8 +306,7 @@ class InteractiveSessionManager:
         if actual_n < n:
             print(f"Warning: only {len(history)} tactic(s) applied; rolling back all.")
 
-        # Routed through the controller so that a rollback landing on a helper
-        # lemma's '{' also removes its assert, exactly as it does for the agent.
+        # Via the controller, so landing on a lemma's '{' also drops its assert.
         proof_tree_str = (
             self.controller.proof_tree.get_proof_tree_string()
             if self.controller.proof_tree is not None else ''
@@ -412,19 +407,16 @@ class InteractiveSessionManager:
         print(visualizer.render_state(goals))
 
     def _report(self, result):
+        # step_generator() already renders each action; only add what it omits.
         t = result.get('type')
         if t == 'tactic':
-            tactic = result.get('tactic', '?')
-            success = result.get('success', False)
-            print(visualizer.render_action('tactic', tactic, success), end='')
-            if success and result.get('proof_complete'):
-                print("🎉 Proof complete!")
-            elif not success:
+            if result.get('success'):
+                if result.get('proof_complete'):
+                    print("🎉 Proof complete!")
+            else:
                 print(f"  — {result.get('error', '')}")
         elif t == 'rollback':
-            if result.get('success'):
-                print(f"Agent rolled back {result.get('distance', '?')} step(s).")
-            else:
+            if not result.get('success'):
                 print("Agent rollback failed.")
         elif t == 'done':
             if result.get('success'):

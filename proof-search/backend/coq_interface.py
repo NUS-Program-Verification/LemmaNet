@@ -145,7 +145,11 @@ class CoqInterface:
             self.proof = self.get_unproven_proof()
             
             if not self.proof:
-                self.logger.warning("No unproven proof found in file")
+                self.last_error = (
+                    "No unproven proof found in file — every proof is already "
+                    "closed with Qed, so there is nothing to prove"
+                )
+                self.logger.warning(self.last_error)
                 return False
             
             # Pop 'Admitted.' to open the proof for tactic replay

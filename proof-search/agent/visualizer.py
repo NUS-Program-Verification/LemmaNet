@@ -231,8 +231,7 @@ def _rich_box(body: str, title: str) -> str:
     from rich.panel import Panel as _Panel
 
     buf = StringIO()
-    # Rich decides on colour from the file it writes to, and a StringIO is never
-    # a terminal, so ask the real stdout instead or every style is stripped.
+    # Rich reads colour support from its output file; a StringIO is never a tty.
     c = _Console(file=buf, highlight=False, markup=False, force_terminal=sys.stdout.isatty())
     c.print(_Panel(body, title=title, expand=False))
     return buf.getvalue()
