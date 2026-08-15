@@ -3,6 +3,21 @@ from typing import List, Optional, Dict, Any
 from datetime import datetime
 from graphviz import Digraph
 from utils.logger import setup_logger
+from utils.coq_utils import parse_assert_statement
+
+
+def _annotate_helper_lemma(label: str) -> str:
+    """Mark the assert and braces of a helper lemma sub-proof in tree output."""
+    stripped = label.strip()
+    if stripped == '{':
+        return "{  (helper lemma sub-proof)"
+    if stripped == '}':
+        return "}  (sub-proof closed)"
+    if stripped.startswith("assert"):
+        name, _ = parse_assert_statement(stripped)
+        if name:
+            return f"{label}  ⟨helper lemma {name}⟩"
+    return label
 
 class ProofTreeNode:
     def __init__(
@@ -594,6 +609,7 @@ class ProofTree:
 
         def _walk(node: "ProofTreeNode", indent: str = "") -> None:
             label = node.tactic.strip() if not node.is_subgoal_node() else node.tactic
+            label = _annotate_helper_lemma(label)
             lines.append(f"{indent}{label}  [{node.status}]")
             for child in node.children:
                 _walk(child, indent + "  ")

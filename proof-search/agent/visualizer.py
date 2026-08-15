@@ -106,6 +106,8 @@ def explain(context_manager) -> Dict[str, Any]:
         result["last_action_content"] = info.get("content")
         result["last_query"] = info.get("query")
         result["last_query_result"] = info.get("query_result")
+        result["helper_lemma"] = info.get("helper_lemma")
+        result["helper_lemma_purpose"] = info.get("helper_lemma_purpose")
     return result
 
 
@@ -113,11 +115,26 @@ def explain(context_manager) -> Dict[str, Any]:
 # Public API: terminal rendering (str)
 # ---------------------------------------------------------------------------
 
-def render_state(goals_str: str, title: str = "Proof State") -> str:
+def render_state(
+    goals_str: str,
+    title: str = "Proof State",
+    open_lemmas: Optional[List[Dict[str, Any]]] = None,
+) -> str:
     """
     Return a formatted, boxed terminal string for the current proof state.
+    open_lemmas (see ProofController.helper_lemma_context) adds a breadcrumb so
+    the goal is not mistaken for the parent goal.
     """
     body = _clean_goals_str(goals_str)
+    if open_lemmas:
+        innermost = open_lemmas[-1]
+        trail = " ▸ ".join(hl["name"] or "?" for hl in open_lemmas)
+        header = (
+            f"↳ helper lemma sub-proof (depth {len(open_lemmas)}): {trail}\n"
+            f"  {innermost['assert_statement']}\n"
+        )
+        body = f"{header}\n{body}"
+        title = f"{title} — proving {innermost['name'] or 'helper lemma'}"
     return _rich_box(body, title) if _RICH else _plain_box(body, title)
 
 
@@ -179,6 +196,14 @@ def _format_explain_body(data: Dict[str, Any]) -> str:
     else:
         lines.append("Last action: (none)")
 
+    helper_lemma = data.get("helper_lemma")
+    if helper_lemma:
+        lines.append("")
+        lines.append(f"Last helper lemma: {helper_lemma}")
+        purpose = data.get("helper_lemma_purpose") or ""
+        if purpose:
+            lines.append(f"  Purpose: {purpose}")
+
     query = data.get("last_query")
     if query:
         lines.append("")
@@ -198,6 +223,16 @@ def _format_explain_body(data: Dict[str, Any]) -> str:
 # Plain-text renderers
 # ---------------------------------------------------------------------------
 
+def _helper_lemma_body(content: Dict[str, Any]) -> str:
+    """Body text for a proposed helper lemma panel (an open_helper_lemma result)."""
+    lines = [f"{content['name']}: {content['statement']}"]
+    if content["purpose"]:
+        lines.append(f"Purpose: {content['purpose']}")
+    if content["depth"]:
+        lines.append(f"Nested inside {content['depth']} other helper lemma(s)")
+    return "\n".join(lines)
+
+
 def _plain_box(body: str, title: str) -> str:
     """Wrap body text in a plain-text box with a title header."""
     sep = "=" * 52
@@ -212,11 +247,21 @@ def _plain_action(action_type: str, content: Any, success: bool) -> str:
         return _plain_box(str(content), "Plan")
     if action_type == "tactic":
         return f"[TACTIC {icon}] {content}"
+    if action_type == "helper_lemma":
+        if not success:
+            return f"[HELPER LEMMA ✗] {content['assert_statement']}\n  — {content['error']}\n"
+        return _plain_box(_helper_lemma_body(content), "Helper Lemma") + "\n"
+    if action_type == "helper_lemma_closed":
+        name = content["name"] or content["assert_statement"]
+        note = " (recorded for reuse)" if content["recorded"] else ""
+        return f"[HELPER LEMMA ✓] {name} proved — back in the parent proof{note}\n"
     if action_type == "query":
         return f"[QUERY] {content}"
     if action_type == "rollback":
         reason = content.get("reason", "") if isinstance(content, dict) else str(content)
         steps = content.get("steps", 1) if isinstance(content, dict) else 1
+        if not success:
+            return f"[ROLLBACK ✗] {reason}\n  — {content['message']}\n"
         return f"[ROLLBACK ×{steps}] {reason}"
     return f"[{action_type.upper()}] {content}"
 
@@ -250,12 +295,26 @@ def _rich_action(action_type: str, content: Any, success: bool) -> str:
         color = "green" if success else "red"
         icon = "✓" if success else "✗"
         c.print(f"  [{color}][{icon} Tactic][/{color}] [bold]{content}[/bold]")
+    elif action_type == "helper_lemma":
+        if success:
+            c.print(_Panel(_helper_lemma_body(content), title="[bold magenta]Helper Lemma[/bold magenta]", expand=False))
+        else:
+            c.print(f"  [red][✗ Helper Lemma][/red] [bold]{content['assert_statement']}[/bold]")
+            c.print(f"  [red]—[/red] {content['error']}")
+    elif action_type == "helper_lemma_closed":
+        name = content["name"] or content["assert_statement"]
+        note = " [dim](recorded for reuse)[/dim]" if content["recorded"] else ""
+        c.print(f"  [magenta][✓ Helper Lemma][/magenta] [bold]{name}[/bold] proved — back in the parent proof{note}")
     elif action_type == "query":
         c.print(f"  [cyan][? Query][/cyan] {content}")
     elif action_type == "rollback":
         reason = content.get("reason", "") if isinstance(content, dict) else str(content)
         steps = content.get("steps", 1) if isinstance(content, dict) else 1
-        c.print(f"  [yellow][↩ Rollback ×{steps}][/yellow] {reason}")
+        if success:
+            c.print(f"  [yellow][↩ Rollback ×{steps}][/yellow] {reason}")
+        else:
+            c.print(f"  [red][✗ Rollback][/red] {reason}")
+            c.print(f"  [red]—[/red] {content['message']}")
     else:
         c.print(f"  [{action_type.upper()}] {content}")
 

@@ -8,7 +8,7 @@ from agent.proof_tree import ProofTree
 from agent import visualizer
 from utils.recorder import create_proof_recorder
 from utils.logger import clean_ansi_codes, setup_logger
-from utils.coq_utils import hints_from_error, goal_diff, extract_theorem_name
+from utils.coq_utils import hints_from_error, goal_diff, parse_assert_statement, extract_theorem_name
 from utils.config import InteractiveConfig
 
 class ProofController:
@@ -214,9 +214,8 @@ class ProofController:
 
     def _detect_theorem_name(self) -> str:
         """
-        Name of the theorem about to be proved, read from its statement in the
-        Coq file. Used when the caller did not supply one, so that recorded
-        tactics and helper lemmas keep their provenance instead of 'unnamed'.
+        Name of the theorem about to be proved, read from its statement. Used when
+        the caller supplies none, so history keeps provenance instead of 'unnamed'.
         """
         proof = self.coq.get_unproven_proof()
         if not proof:
@@ -485,6 +484,9 @@ class ProofController:
                 else:
                     prompt = f"Rollback failed: {rollback_result.get('message', 'Unknown error')}\nPlease continue with tactics."
                     self.logger.error(f"❌ Rollback failed: {rollback_result.get('message')}")
+                    print(visualizer.render_action(
+                        'rollback', {**rollback_data, 'message': rollback_result['message']}, False
+                    ), end='')
                     yield {'type': 'rollback', 'success': False, 'distance': 0}
                 continue
 
@@ -492,9 +494,14 @@ class ProofController:
 
                 self.gen_step_count += 1 # Update generation step count
 
-                # Check if we've exceeded the maximum helper lemma depth
-                if len(self.helper_lemma_stack) >= self.MAX_HELPER_LEMMA_DEPTH:
-                    self.logger.warning(f"⚠️  Helper lemma depth limit reached ({self.MAX_HELPER_LEMMA_DEPTH}). Rejecting new helper lemma proposal.")
+                # Handle helper lemma proposal - returns the formatted assert statement
+                tactic_content = self.context_manager.handle_helper_lemma_call(decision_content, tool_call_id)
+
+                hl_result = self.open_helper_lemma(
+                    tactic_content, source='agent', purpose=decision_content['purpose']
+                )
+
+                if hl_result['depth_exceeded']:
                     prompt = f"Helper lemma proposal rejected: maximum nesting depth ({self.MAX_HELPER_LEMMA_DEPTH}) reached.\n"
                     prompt += f"Current depth: {len(self.helper_lemma_stack)}. Please use regular tactics instead of proposing new helper lemmas.\n"
                     prompt += "Consider using existing hypotheses or searching for relevant lemmas."
@@ -502,111 +509,30 @@ class ProofController:
                            'error': 'Maximum helper lemma depth reached', 'goals_after': proof_state.get('goals', ''), 'proof_complete': False}
                     continue
 
-                # Handle helper lemma proposal - returns the formatted assert statement
-                tactic_content = self.context_manager.handle_helper_lemma_call(decision_content, tool_call_id)
-                self.logger.info(f"🔧 Step {self.global_step_id}: HELPER LEMMA proposed (current depth: {len(self.helper_lemma_stack)})")
-                self.logger.info(f"Generated tactic:\n{tactic_content}")
-
-                # Record in recorder
-                if self.enable_recording and self.recorder:
-                    self.recorder.record_helper_lemma(tactic_content)
-
-                # Save states before tactic application
-                subgoals_before = self.coq.get_subgoals()
-                goals_before = proof_state.get('goals', '').strip()
-                hypotheses_before = proof_state.get('hypotheses', '').strip()
-
-                # Apply the helper lemma tactic (assert statement)
-                success = self._apply_tactic(tactic_content)
-                print(visualizer.render_action('tactic', tactic_content, success))
-
-                if success:
-                    # Handle assert statement:
-                    # Get current state after tactic
-                    subgoals_after_assert = self.coq.get_subgoals()
-                    hypotheses_after_assert = self.coq.get_hypothesis()
-                    goals_after_assert = self.coq.get_goal_str()
-
-                    # Handle successful assert statement
-                    tactic_with_state = self._handle_successful_tactic(
-                        tactic_content,
-                        subgoals_before, subgoals_after_assert,
-                        goals_before, goals_after_assert,
-                        hypotheses_before, hypotheses_after_assert
-                    )
-                    tactic_with_state['source'] = 'agent'
-                    self._tactics_with_states.append(tactic_with_state)
-
-                    # Handle opening brace:
-                    # Manually add opening brace to enter sub-proof context
-                    brace_success = self._apply_tactic("{")
-                    if brace_success:
-                        # Push to helper lemma stack to track this sub-proof
-                        self.helper_lemma_stack.append('{')
-                        self.logger.info(f"🔧 Pushed '{{' to helper lemma stack (depth: {len(self.helper_lemma_stack)})")
-
-                    assert brace_success, "Failed to apply opening brace after helper lemma"
-
-                    # Get current state after opening brace
-                    subgoals_after_brace = self.coq.get_subgoals()
-                    hypotheses_after_brace = self.coq.get_hypothesis()
-                    goals_after_brace = self.coq.get_goal_str()
-
-                    # INCREMENT STEP COUNT before applying opening brace
-                    # This ensures { gets its own unique step number
-                    self.global_step_id += 1
-                    self.logger.debug(f"📊 Incremented step count to {self.global_step_id} before applying opening brace")
-
-                    # Handle successful opening brace
-                    tactic_with_state = self._handle_successful_tactic(
-                        "{",
-                        subgoals_after_assert, subgoals_after_brace,
-                        goals_after_assert, goals_after_brace,
-                        hypotheses_after_assert, hypotheses_after_brace
-                    )
-                    tactic_with_state['source'] = 'agent'
-                    self._tactics_with_states.append(tactic_with_state)
-
+                if hl_result['success']:
                     _clear_error_tracking()
                     last_tool_success = True
+                    proof_tree_str = self.proof_tree.get_proof_tree_string()
 
-                    # Try to auto-replay a cached proof for this helper lemma
-                    cached_proof = self.tactic_history.find_helper_lemma_proof(tactic_content) if self.tactic_history else None
-                    replay_ok = False
-                    if cached_proof:
-                        replay_ok = self._replay_helper_lemma_proof(
-                            cached_proof, self._tactics_with_states
-                        )
-
-                    if replay_ok:
-                        # _replay_helper_lemma_proof handled everything:
-                        # inner tactics, closing brace, stack pop
-                        hyps_after_close = self.coq.get_hypothesis()
-                        proof_tree_str = self.proof_tree.get_proof_tree_string()
+                    if hl_result['replayed']:
                         prompt = f"Helper lemma proved automatically from cached proof. Returned to parent proof context.\n\n"
                         prompt += "## CURRENT PROOF TREE:\n"
                         prompt += f"{proof_tree_str}\n"
-                        prompt += f"Hypotheses: {hyps_after_close if hyps_after_close else 'None'}\n"
-                        self.logger.info(f"✅ Step {self.global_step_id}: HELPER LEMMA APPLIED AND AUTO-PROVED!")
+                        prompt += f"Hypotheses: {hl_result['hypotheses_after'] if hl_result['hypotheses_after'] else 'None'}\n"
                     else:
                         # No cached proof or replay failed --> prove manually
-                        proof_tree_str = self.proof_tree.get_proof_tree_string()
                         prompt = f"Helper lemma assert statement applied successfully. You are now in a sub-proof context.\n\n"
                         prompt += "## CURRENT PROOF TREE:\n"
                         prompt += f"{proof_tree_str}\n\n"
-                        prompt += f"Hypotheses: {hypotheses_after_brace if hypotheses_after_brace else 'None'}\n\n"
+                        prompt += f"Hypotheses: {hl_result['hypotheses_after'] if hl_result['hypotheses_after'] else 'None'}\n\n"
                         prompt += "Please provide tactics to prove this helper lemma."
-                        self.logger.info(f"✅ Step {self.global_step_id}: HELPER LEMMA ASSERT AND OPENING BRACE APPLIED SUCCESSFULLY!")
 
                     yield {'type': 'tactic', 'tactic': tactic_content, 'success': True,
-                           'error': None, 'goals_after': self.coq.get_goal_str() or '', 'proof_complete': False}
+                           'error': None, 'goals_after': hl_result['goals_after'], 'proof_complete': False}
                 else:
                     # Failed to apply helper lemma assert statement
-                    failed_error = self.coq.get_last_error()
-                    self.logger.info(f"⚠️  Step {self.global_step_id}: HELPER LEMMA TACTIC failed with error: {failed_error}")
-
+                    failed_error = hl_result['error']
                     consecutive_errors += 1
-                    self.failed_tactics.append(tactic_content)
 
                     prompt = f"Helper lemma assert statement application failed with error: {failed_error}\n"
                     prompt += "Please revise the helper lemma statement or try a different approach.\n"
@@ -617,7 +543,7 @@ class ProofController:
                     prompt += self._provide_history_feedback(consecutive_errors)
 
                     yield {'type': 'tactic', 'tactic': tactic_content, 'success': False,
-                           'error': failed_error, 'goals_after': goals_before, 'proof_complete': False}
+                           'error': failed_error, 'goals_after': proof_state.get('goals', '').strip(), 'proof_complete': False}
 
                 continue
 
@@ -716,81 +642,20 @@ class ProofController:
                     yield {'type': 'tactic', 'tactic': tactic_content, 'success': True,
                            'error': None, 'goals_after': '', 'proof_complete': True}
                     break
-                elif self.helper_lemma_stack and self.coq.is_helper_lemma_proof_complete():
-                    # '}' should have been applied in is_helper_lemma_proof_complete()
-                    proof = self.coq.get_unproven_proof()
-                    assert proof and proof.steps and proof.steps[-1].text.strip() in ['}', ' }']
 
-                    self.logger.info(f"🎉 Helper lemma sub-proof completed! Closing brace applied")
-                    self.logger.debug(f"📚 Helper lemma stack depth before closing: {len(self.helper_lemma_stack)}")
-
-                    # Pop from helper lemma stack
-                    self.helper_lemma_stack.pop()
-                    self.logger.info(f"✅ Returned to parent proof context")
-                    self.logger.debug(f"📚 Helper lemma stack depth after closing: {len(self.helper_lemma_stack)}")
-
-                    # Get proof state after closing brace
-                    subgoals_after_brace = self.coq.get_subgoals()
-                    goals_after_brace = self.coq.get_goal_str()
-                    hypotheses_after_brace = self.coq.get_hypothesis()
-
-                    # INCREMENT STEP COUNT after applying closing brace
-                    # This ensures } gets its own unique step number
-                    self.global_step_id += 1
-                    self.logger.debug(f"📊 Incremented step count to {self.global_step_id} after applying closing brace")
-
-                    # Handle closing brace
-                    tactic_with_state = self._handle_successful_tactic(
-                        "}",
-                        subgoals_after, subgoals_after_brace,
-                        current_goals_after, goals_after_brace,
-                        current_hypotheses_after, hypotheses_after_brace
-                    )
-                    tactic_with_state['source'] = 'agent'
-                    self._tactics_with_states.append(tactic_with_state)
-
-                    # Update history with successful sub-proof (helper lemma).
-                    # Walk backwards to the '{' that opened this sub-proof,
-                    # stepping over any nested '{ ... }' pair on the way. A plain
-                    # "stop at the first '{'" scan would stop inside a helper
-                    # lemma proved within this one, and record that inner assert
-                    # against the tail of this proof.
-                    brace_idx = None
-                    nested = 0
-                    for idx in range(len(self._tactics_with_states) - 2, -1, -1):  # skip the '}' just added
-                        tactic = self._tactics_with_states[idx]['tactic'].strip()
-                        if tactic == '}':
-                            nested += 1
-                        elif tactic == '{':
-                            if nested == 0:
-                                brace_idx = idx
-                                break
-                            nested -= 1
-
-                    # Everything between '{' and the closing '}' is this lemma's
-                    # proof, and the assert statement is right before '{'
-                    hl_tactics_with_states = (
-                        self._tactics_with_states[brace_idx + 1:] if brace_idx is not None else []
-                    )
-                    assert_tactic_state = (
-                        self._tactics_with_states[brace_idx - 1]
-                        if brace_idx is not None and brace_idx > 0 else None
-                    )
-
-                    # Record the complete helper lemma as a reusable unit
-                    if assert_tactic_state is not None:
-                        self._record_successful_helper_lemma(
-                            assert_tactic_state, hl_tactics_with_states
-                        )
-
+                closed_lemma = self.close_helper_lemma_if_complete(
+                    subgoals_after, current_goals_after, current_hypotheses_after, source='agent'
+                )
+                if closed_lemma is not None:
+                    print(visualizer.render_action('helper_lemma_closed', closed_lemma, True), end='')
                     proof_tree_str = self.proof_tree.get_proof_tree_string()
                     prompt += (
                         "Helper lemma sub-proof completed and closed with '}'. Returned to parent proof context.\n\n"
                         f"## CURRENT PROOF TREE:\n{proof_tree_str}\n"
-                        f"Hypotheses: {hypotheses_after_brace if hypotheses_after_brace else 'None'}\n"
+                        f"Hypotheses: {closed_lemma['hypotheses_after'] if closed_lemma['hypotheses_after'] else 'None'}\n"
                     )
                     yield {'type': 'tactic', 'tactic': tactic_content, 'success': True,
-                           'error': None, 'goals_after': goals_after_brace or '', 'proof_complete': False}
+                           'error': None, 'goals_after': closed_lemma['goals_after'], 'proof_complete': False}
                 else:
                     proof_tree_str = self.proof_tree.get_proof_tree_string()
                     goals_after_str = str(current_goals_after).strip() if current_goals_after else ''
@@ -859,6 +724,7 @@ class ProofController:
         self,
         cached_tactics: List[str],
         successful_tactics_with_states: List[Dict[str, Any]],
+        source: str = 'agent',
     ) -> bool:
         """Replay a cached proof for a helper lemma sub-proof.
         Applies all inner tactics, the closing brace, and pops the stack.
@@ -887,7 +753,7 @@ class ProofController:
                 goals_before, goals_after,
                 hyps_before, hyps_after
             )
-            tw['source'] = 'agent'
+            tw['source'] = source
             successful_tactics_with_states.append(tw)
             self.successful_tactics.append(tactic)
 
@@ -911,6 +777,265 @@ class ProofController:
             self.logger.info(f"📝 Recorded helper lemma: {assert_state['tactic'][:60]}")
         except Exception as e:
             self.logger.error(f"❌ Failed to record helper lemma: {e}")
+
+    ###############################
+    ##  Helper lemma lifecycle   ##
+    ###############################
+    # Both step_generator() and the REPL drive helper lemmas through these.
+
+    def helper_lemma_enabled(self) -> bool:
+        """Whether helper lemmas are available at all (ablation.enable_helper_lemma)."""
+        return self.context_manager.enable_helper_lemma
+
+    def helper_lemma_context(self) -> List[Dict[str, Any]]:
+        """Open helper lemma sub-proofs, outermost first; brace_index locates each '{'."""
+        stack: List[Dict[str, Any]] = []
+        states = self._tactics_with_states
+        for idx, state in enumerate(states):
+            tactic = state['tactic'].strip()
+            if tactic == '{':
+                assert_statement = states[idx - 1]['tactic'].strip() if idx > 0 else ''
+                name, statement = parse_assert_statement(assert_statement)
+                stack.append({
+                    'assert_statement': assert_statement,
+                    'name': name,
+                    'statement': statement,
+                    'brace_index': idx,
+                })
+            elif tactic == '}' and stack:
+                stack.pop()
+        return stack
+
+    def open_helper_lemma(self, assert_statement: str, source: str = 'agent', purpose: str = '') -> Dict[str, Any]:
+        """
+        Introduce a helper lemma: apply its assert, then '{' to enter the sub-proof.
+        A cached proof of the same statement is replayed (result['replayed']).
+
+        The caller allocates the assert's step number, as it does for any tactic.
+        Returns: success, error, depth_exceeded, replayed, depth, assert_statement,
+        name, statement, purpose, goals_after, hypotheses_after.
+        """
+        name, statement = parse_assert_statement(assert_statement)
+        result: Dict[str, Any] = {
+            'success': False,
+            'error': None,
+            'depth_exceeded': False,
+            'replayed': False,
+            'depth': len(self.helper_lemma_stack),
+            'assert_statement': assert_statement,
+            'name': name,
+            'statement': statement,
+            'purpose': purpose,
+            'goals_after': '',
+            'hypotheses_after': '',
+        }
+
+        if len(self.helper_lemma_stack) >= self.MAX_HELPER_LEMMA_DEPTH:
+            result['depth_exceeded'] = True
+            result['error'] = f"Maximum helper lemma nesting depth ({self.MAX_HELPER_LEMMA_DEPTH}) reached"
+            self.logger.warning(f"⚠️  Helper lemma depth limit reached ({self.MAX_HELPER_LEMMA_DEPTH}). Rejecting new helper lemma proposal.")
+            print(visualizer.render_action('helper_lemma', result, False), end='')
+            return result
+
+        self.logger.info(f"🔧 Step {self.global_step_id}: HELPER LEMMA proposed (current depth: {len(self.helper_lemma_stack)})")
+        self.logger.info(f"Generated tactic:\n{assert_statement}")
+
+        if self.enable_recording and self.recorder:
+            self.recorder.record_helper_lemma(assert_statement)
+
+        subgoals_before = self.coq.get_subgoals()
+        goals_before = (self.coq.get_goal_str() or '').strip()
+        hypotheses_before = (self.coq.get_hypothesis() or '').strip()
+
+        success = self._apply_tactic(assert_statement)
+        if not success:
+            result['error'] = self.coq.get_last_error()
+        print(visualizer.render_action('helper_lemma', result, success), end='')
+
+        if not success:
+            self.failed_tactics.append(assert_statement)
+            self.logger.info(f"⚠️  Step {self.global_step_id}: HELPER LEMMA TACTIC failed with error: {result['error']}")
+            return result
+
+        # Assert succeeded: record it, then open the sub-proof with '{'
+        subgoals_after_assert = self.coq.get_subgoals()
+        hypotheses_after_assert = self.coq.get_hypothesis()
+        goals_after_assert = self.coq.get_goal_str()
+
+        tactic_with_state = self._handle_successful_tactic(
+            assert_statement,
+            subgoals_before, subgoals_after_assert,
+            goals_before, goals_after_assert,
+            hypotheses_before, hypotheses_after_assert
+        )
+        tactic_with_state['source'] = source
+        self._tactics_with_states.append(tactic_with_state)
+
+        brace_success = self._apply_tactic("{")
+        if brace_success:
+            self.helper_lemma_stack.append('{')
+            self.logger.info(f"🔧 Pushed '{{' to helper lemma stack (depth: {len(self.helper_lemma_stack)})")
+
+        assert brace_success, "Failed to apply opening brace after helper lemma"
+
+        subgoals_after_brace = self.coq.get_subgoals()
+        hypotheses_after_brace = self.coq.get_hypothesis()
+        goals_after_brace = self.coq.get_goal_str()
+
+        # INCREMENT STEP COUNT before applying opening brace
+        # This ensures { gets its own unique step number
+        self.global_step_id += 1
+        self.logger.debug(f"📊 Incremented step count to {self.global_step_id} before applying opening brace")
+
+        tactic_with_state = self._handle_successful_tactic(
+            "{",
+            subgoals_after_assert, subgoals_after_brace,
+            goals_after_assert, goals_after_brace,
+            hypotheses_after_assert, hypotheses_after_brace
+        )
+        tactic_with_state['source'] = source
+        self._tactics_with_states.append(tactic_with_state)
+
+        result['success'] = True
+        result['depth'] = len(self.helper_lemma_stack)
+        result['goals_after'] = goals_after_brace or ''
+        result['hypotheses_after'] = hypotheses_after_brace or ''
+        self.logger.info(f"✅ Step {self.global_step_id}: HELPER LEMMA ASSERT AND OPENING BRACE APPLIED SUCCESSFULLY!")
+
+        # Try to auto-replay a cached proof for this helper lemma
+        cached_proof = self.tactic_history.find_helper_lemma_proof(assert_statement) if self.tactic_history else None
+        if cached_proof:
+            result['replayed'] = self._replay_helper_lemma_proof(
+                cached_proof, self._tactics_with_states, source=source
+            )
+            if result['replayed']:
+                # inner tactics, closing brace and stack pop are all handled
+                result['depth'] = len(self.helper_lemma_stack)
+                result['goals_after'] = self.coq.get_goal_str() or ''
+                result['hypotheses_after'] = self.coq.get_hypothesis() or ''
+                self.logger.info(f"✅ Step {self.global_step_id}: HELPER LEMMA APPLIED AND AUTO-PROVED!")
+
+        return result
+
+    def close_helper_lemma_if_complete(
+        self,
+        subgoals_before: Any,
+        goals_before: str,
+        hypotheses_before: str,
+        source: str = 'agent',
+        record: bool = True,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Close the innermost helper lemma sub-proof when its goal is discharged.
+        The *_before arguments describe the state after the last tactic and before
+        '}', which is_helper_lemma_proof_complete() applies as a side effect.
+
+        Returns None while the sub-proof is still open. record=False keeps the
+        proof out of history, as when 'admit' discharged it.
+        """
+        if not self.helper_lemma_stack or not self.coq.is_helper_lemma_proof_complete():
+            return None
+
+        # '}' should have been applied in is_helper_lemma_proof_complete()
+        proof = self.coq.get_unproven_proof()
+        assert proof and proof.steps and proof.steps[-1].text.strip() in ['}', ' }']
+
+        self.logger.info(f"🎉 Helper lemma sub-proof completed! Closing brace applied")
+        self.logger.debug(f"📚 Helper lemma stack depth before closing: {len(self.helper_lemma_stack)}")
+
+        self.helper_lemma_stack.pop()
+        self.logger.info(f"✅ Returned to parent proof context")
+        self.logger.debug(f"📚 Helper lemma stack depth after closing: {len(self.helper_lemma_stack)}")
+
+        subgoals_after_brace = self.coq.get_subgoals()
+        goals_after_brace = self.coq.get_goal_str()
+        hypotheses_after_brace = self.coq.get_hypothesis()
+
+        # INCREMENT STEP COUNT after applying closing brace
+        # This ensures } gets its own unique step number
+        self.global_step_id += 1
+        self.logger.debug(f"📊 Incremented step count to {self.global_step_id} after applying closing brace")
+
+        tactic_with_state = self._handle_successful_tactic(
+            "}",
+            subgoals_before, subgoals_after_brace,
+            goals_before, goals_after_brace,
+            hypotheses_before, hypotheses_after_brace
+        )
+        tactic_with_state['source'] = source
+        self._tactics_with_states.append(tactic_with_state)
+
+        # Walk back to this sub-proof's '{', stepping over nested pairs: stopping at
+        # the first '{' would record a nested lemma against this proof's tail.
+        brace_idx = None
+        nested = 0
+        for idx in range(len(self._tactics_with_states) - 2, -1, -1):  # skip the '}' just added
+            tactic = self._tactics_with_states[idx]['tactic'].strip()
+            if tactic == '}':
+                nested += 1
+            elif tactic == '{':
+                if nested == 0:
+                    brace_idx = idx
+                    break
+                nested -= 1
+
+        # The proof is everything after '{'; the assert sits right before it
+        hl_tactics_with_states = self._tactics_with_states[brace_idx + 1:] if brace_idx is not None else []
+        assert_tactic_state = (
+            self._tactics_with_states[brace_idx - 1]
+            if brace_idx is not None and brace_idx > 0 else None
+        )
+
+        # Record the complete helper lemma as a reusable unit
+        recorded = False
+        if assert_tactic_state is not None and record:
+            self._record_successful_helper_lemma(assert_tactic_state, hl_tactics_with_states)
+            recorded = True
+
+        assert_statement = assert_tactic_state['tactic'] if assert_tactic_state else ''
+        return {
+            'assert_statement': assert_statement,
+            'name': parse_assert_statement(assert_statement)[0],
+            'recorded': recorded,
+            'goals_after': goals_after_brace or '',
+            'hypotheses_after': hypotheses_after_brace or '',
+        }
+
+    def abandon_helper_lemma(self) -> Dict[str, Any]:
+        """
+        Roll back the innermost open helper lemma, removing its assert and '{'
+        together with every tactic tried inside it.
+        """
+        open_lemmas = self.helper_lemma_context()
+        if not open_lemmas:
+            return {'success': False, 'message': 'Not inside a helper lemma sub-proof.'}
+
+        # Remove the assert as well, so the parent goal is restored untouched
+        assert_idx = max(0, open_lemmas[-1]['brace_index'] - 1)
+        rb_steps = len(self._tactics_with_states) - assert_idx
+
+        proof_tree_str = self.proof_tree.get_proof_tree_string() if self.proof_tree else ''
+        result = self._execute_rollback(
+            self._tactics_with_states,
+            reason='Abandon helper lemma sub-proof',
+            proof_tree_str=proof_tree_str,
+            rb_steps=rb_steps,
+        )
+
+        if result['success']:
+            target_step_number = result['target_step_number']
+            if result['target_index'] > 0:
+                self._tactics_with_states[:] = [
+                    t for t in self._tactics_with_states if t['step_number'] <= target_step_number
+                ]
+            else:
+                self._tactics_with_states[:] = []
+            self._refresh_helper_lemma_stack_from_history()
+            result['assert_statement'] = open_lemmas[-1]['assert_statement']
+            result['name'] = open_lemmas[-1]['name']
+            self.logger.info(f"🗑️  Abandoned helper lemma: {result['assert_statement'][:60]}")
+
+        return result
 
     def _handle_successful_tactic(self, successful_tactic, subgoals_before, subgoals_after, goals_before, goals_after, hypotheses_before, hypotheses_after) -> Dict[str, Any]:
         """

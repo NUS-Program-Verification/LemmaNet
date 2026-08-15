@@ -232,6 +232,7 @@ Or enable it permanently in your config:
 - **Stepping through proofs** — you can step through AutoRocq's generation and understand its trajectory.
 - **Adding hints for agent** — You can add natural language `hint` to guide AutoRocq's proof strategy.
 - **Co-writing proofs** — you can directly add `tactic`, print `tree`, run `search`, or `rollback` as you wish. Existing proof steps and manual edits are preserved, AutoRocq picks up exactly where you left.
+- **Proposing helper lemmas** — you can introduce your own helper lemma with `lemma`, and `drop` a sub-proof that is not working out. User-proposed and agent-proposed lemmas go through the same path, so yours are cached and replayed just the same.
 
 #### REPL commands
 
@@ -240,14 +241,19 @@ Or enable it permanently in your config:
 | `step`         | Agent takes one action (tactic attempt or rollback), then pauses                                                                                                                                |
 | `run`          | Agent runs until the focused goal changes, the agent rolls back, or the proof completes. Failed tactics are handled internally and do not stop `run`                                            |
 | `tactic <tac>` | Apply a Rocq tactic directly (bypasses the LLM). Example: `tactic intros n.`                                                                                                                    |
+| `lemma <stmt>` | Introduce a helper lemma and enter its sub-proof. Name it explicitly (`lemma Hpos: 0 <= n`) or let one be generated (`lemma 0 <= n`). If the same lemma was proved before, its cached proof is replayed and the sub-proof closes immediately. Disabled when `ablation.enable_helper_lemma` is `false` |
+| `drop`         | Abandon the current helper lemma sub-proof, removing its `assert` and every tactic tried inside it, and return to the parent goal untouched                                                     |
+| `admit`        | Admit the current helper lemma sub-proof to move on. The admitted lemma is *not* recorded, and the enclosing proof can no longer be closed with `Qed` until it is dropped or rolled back        |
 | `hint <text>`  | Inject a natural-language hint into the agent's next prompt. Example: `hint try induction on n`                                                                                                 |
-| `rollback [n]` | Undo the last `n` applied tactics (default 1), regardless of whether they were applied by you or the agent. If `n` exceeds the number of applied tactics, rolls back to `Proof.` with a warning |
+| `rollback [n]` | Undo the last `n` applied tactics (default 1), regardless of whether they were applied by you or the agent. A rollback landing on a helper lemma's `{` removes its `assert` too. If `n` exceeds the number of applied tactics, rolls back to `Proof.` with a warning |
 | `search <cmd>` | Run a Rocq query and print the results (display-only; does not inject into LLM context). Examples: `search Search Z.add`, `search Print Z.add_comm`, `search Check Z.add`                       |
-| `status`       | Display the current proof goal and hypotheses                                                                                                                                                   |
-| `explain`      | Show agent reasoning history                                                                                                                                                                    |
-| `tree`         | Display the current proof tree with tactic history                                                                                                                                              |
+| `status`       | Display the current proof goal and hypotheses. Inside a helper lemma, the sub-proof being proved is shown above the goal                                                                        |
+| `explain`      | Show agent reasoning history, including the last helper lemma proposed and the agent's stated purpose for it                                                                                    |
+| `tree`         | Display the current proof tree with tactic history; helper lemma sub-proofs are marked                                                                                                          |
 | `help`         | Print all available commands                                                                                                                                                                    |
 | `quit`         | Exit the session                                                                                                                                                                                |
+
+While a helper lemma sub-proof is open, the prompt shows which lemma you are proving — `lemmanet[Hpos]>`, or `lemmanet[Hinner @2]>` when nested.
 
 </details> 
 
