@@ -641,9 +641,8 @@ class ContextManager:
 
         if not name or name == 'H':
             self.logger.warning("⚠️  Helper lemma name missing or generic; generating one.")
-            name = generate_helper_lemma_name(statement)
 
-        assert_statement = f"assert ({name}: {statement})"
+        assert_statement = format_assert_statement(statement, name)
 
         self.last_action_info.update({
             "helper_lemma": assert_statement,

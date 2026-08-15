@@ -6,6 +6,9 @@ Commands:
   step              — agent takes one tactic/rollback action
   run               — agent runs until subgoal changes, failure, or proof complete
   tactic <tac>      — apply user-supplied tactic
+  lemma <stmt>      — introduce a helper lemma and enter its sub-proof
+  drop              — abandon the current helper lemma sub-proof
+  admit             — admit the current helper lemma sub-proof and move on
   hint <text>       — inject natural-language hint into next agent step
   rollback [n]      — undo last n tactics (user or agent, default 1)
   search <cmd>      — run a Rocq query (e.g. Search Z.add, Print Z.add_comm, Check Z.add)
@@ -16,17 +19,31 @@ Commands:
   quit              — exit
 """
 
+import re
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
 from agent.proof_controller import ProofController
 from agent import visualizer
+from utils.coq_utils import format_assert_statement
 from utils.logger import setup_logger
 
 _COMMANDS = [
-    "step", "run", "tactic ", "hint ", "rollback", "search ",
+    "step", "run", "tactic ", "lemma ", "drop", "admit",
+    "hint ", "rollback", "search ",
     "status", "tree", "explain", "help", "quit",
 ]
+
+# "Hfoo: 0 <= n" names the lemma; "forall x : Z, ..." does not, so it stays bare.
+_NAMED_LEMMA_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_']*)\s*:\s*(.+)$", re.DOTALL)
+
+
+def _split_lemma_arg(arg: str) -> Tuple[str, str]:
+    """Split a `lemma` argument into (name, statement); name is '' if omitted."""
+    match = _NAMED_LEMMA_RE.match(arg.strip())
+    if match:
+        return match.group(1).strip(), match.group(2).strip()
+    return "", arg.strip()
 
 
 class InteractiveSessionManager:
@@ -112,10 +129,19 @@ class InteractiveSessionManager:
     ## REPL            ##
     #####################
 
+    def _prompt(self) -> str:
+        """Prompt showing which helper lemma sub-proof, if any, is being proved."""
+        open_lemmas = self.controller.helper_lemma_context()
+        if not open_lemmas:
+            return "lemmanet> "
+        name = open_lemmas[-1]['name'] or 'lemma'
+        depth = len(open_lemmas)
+        return f"lemmanet[{name}]> " if depth == 1 else f"lemmanet[{name} @{depth}]> "
+
     def _repl(self):
         while not self._done:
             try:
-                raw = input("autorocq> ").strip()
+                raw = input(self._prompt()).strip()
             except (EOFError, KeyboardInterrupt) as e:
                 self.logger.debug(f"REPL interrupted: {e}")
                 self._do_quit()
@@ -133,6 +159,12 @@ class InteractiveSessionManager:
                     self._do_run()
                 case "tactic":
                     self._do_user_tactic(arg.strip())
+                case "lemma":
+                    self._do_lemma(arg.strip())
+                case "drop":
+                    self._do_drop()
+                case "admit":
+                    self._do_admit()
                 case "hint":
                     self._do_hint(arg.strip())
                 case "rollback":
@@ -194,7 +226,7 @@ class InteractiveSessionManager:
                 self._display_state()
                 return
 
-    def _do_user_tactic(self, tactic: str, silent: bool = False):
+    def _do_user_tactic(self, tactic: str, silent: bool = False, record_helper_lemma: bool = True):
         if not tactic:
             print("Usage: tactic <tactic_string>")
             return
@@ -236,57 +268,61 @@ class InteractiveSessionManager:
             print("🎉 Proof complete!")
             self.controller.is_successful = True
             self._done = True
-        elif self.controller.helper_lemma_stack and self.controller.coq.is_helper_lemma_proof_complete():
-            self.controller.helper_lemma_stack.pop()
-            subgoals_after_brace = self.controller.coq.get_subgoals()
-            goals_after_brace = self.controller.coq.get_goal_str()
-            hyps_after_brace = self.controller.coq.get_hypothesis()
+            return
 
-            self.controller.global_step_id += 1
-            brace_state = self.controller._handle_successful_tactic(
-                "}", subgoals_after, subgoals_after_brace,
-                goals_after or '', goals_after_brace or '',
-                hyps_after or '', hyps_after_brace or ''
-            )
-            brace_state['source'] = 'user'
-            self.controller._tactics_with_states.append(brace_state)
-
-            # Update history with successful sub-proof (helper lemma).
-            # Walk backwards to the '{' that opened this sub-proof, stepping over
-            # any nested '{ ... }' pair on the way. A plain "stop at the first
-            # '{'" scan would stop inside a helper lemma proved within this one,
-            # and record that inner assert against the tail of this proof.
-            states = self.controller._tactics_with_states
-            brace_idx = None
-            nested = 0
-            for idx in range(len(states) - 2, -1, -1):  # skip the '}' just added
-                tactic = states[idx]['tactic'].strip()
-                if tactic == '}':
-                    nested += 1
-                elif tactic == '{':
-                    if nested == 0:
-                        brace_idx = idx
-                        break
-                    nested -= 1
-
-            # Everything between '{' and the closing '}' is this lemma's proof,
-            # and the assert statement is right before '{'
-            hl_tactics_with_states = states[brace_idx + 1:] if brace_idx is not None else []
-            assert_tactic_state = (
-                states[brace_idx - 1] if brace_idx is not None and brace_idx > 0 else None
-            )
-
-            # Record the complete helper lemma as a reusable unit
-            if assert_tactic_state is not None:
-                self.controller._record_successful_helper_lemma(
-                    assert_tactic_state, hl_tactics_with_states
-                )
-
-            if not silent:
-                print("✅ Helper lemma sub-proof closed.")
-                self._display_state()
-        elif not silent:
+        closed = self.controller.close_helper_lemma_if_complete(
+            subgoals_after, goals_after or '', hyps_after or '',
+            source='user', record=record_helper_lemma,
+        )
+        if not silent:
+            if closed is not None:
+                print(visualizer.render_action('helper_lemma_closed', closed, True), end='')
             self._display_state()
+
+    def _do_lemma(self, arg: str):
+        if not self.controller.helper_lemma_enabled():
+            print("Helper lemmas are disabled for this session (ablation.enable_helper_lemma = false).")
+            return
+        if not arg:
+            print("Usage: lemma [<name>:] <statement>   e.g. lemma Hpos: 0 <= n")
+            return
+
+        name, statement = _split_lemma_arg(arg)
+        assert_statement = format_assert_statement(statement, name)
+        self.logger.debug(f"User helper lemma: {assert_statement!r}")
+        self.controller.global_step_id += 1
+        result = self.controller.open_helper_lemma(assert_statement, source='user')
+
+        # open_helper_lemma renders the failure itself
+        if not result['success']:
+            return
+
+        if result['replayed']:
+            print("↺ Proved automatically from a cached proof — back in the parent proof.")
+        else:
+            print(
+                f"Now proving the helper lemma "
+                f"(depth {result['depth']}/{self.controller.MAX_HELPER_LEMMA_DEPTH}). "
+                "Use 'drop' to abandon it."
+            )
+        self._display_state()
+
+    def _do_drop(self):
+        result = self.controller.abandon_helper_lemma()
+        if not result['success']:
+            print(result['message'])
+            return
+        label = result['name'] or result['assert_statement']
+        print(f"Dropped helper lemma {label} ({result['rollback_distance']} step(s) removed).")
+        self._display_state()
+
+    def _do_admit(self):
+        if not self.controller.helper_lemma_context():
+            print("admit only applies inside a helper lemma sub-proof; use 'rollback' or 'quit' otherwise.")
+            return
+        print("⚠️  Admitting this sub-proof — the enclosing proof can no longer be closed with Qed.")
+        print("    Use 'drop' or 'rollback' to remove it before finishing the proof.")
+        self._do_user_tactic("admit.", record_helper_lemma=False)
 
     def _do_hint(self, hint: str):
         if not hint:
@@ -315,7 +351,9 @@ class InteractiveSessionManager:
             history, reason='User rollback', proof_tree_str=proof_tree_str, rb_steps=actual_n
         )
         if not result['success']:
-            print(f"Rollback failed: {result['message']}")
+            print(visualizer.render_action(
+                'rollback', {'reason': 'User rollback', 'message': result['message']}, False
+            ), end='')
             return
 
         target_step_number = result['target_step_number']
@@ -358,6 +396,9 @@ class InteractiveSessionManager:
         print("  hint <text>       — inject hint into next agent step")
         print("  rollback [n]      — undo last n tactics, user or agent (default 1)")
         print("  search <cmd>      — run a Rocq query, e.g. 'search Search Z.add' or 'search Print Z.add_comm'")
+        print("  lemma <stmt>      — introduce a helper lemma, e.g. 'lemma Hpos: 0 <= n'")
+        print("  drop              — abandon the current helper lemma sub-proof")
+        print("  admit             — admit the current helper lemma sub-proof (blocks Qed)")
         print("  status            — display current proof state")
         print("  tree              — display proof tree")
         print("  explain           — show agent reasoning trace")
@@ -404,7 +445,7 @@ class InteractiveSessionManager:
 
     def _display_state(self):
         goals = self.controller.coq.get_goal_str() or ""
-        print(visualizer.render_state(goals))
+        print(visualizer.render_state(goals, open_lemmas=self.controller.helper_lemma_context()))
 
     def _report(self, result):
         # step_generator() already renders each action; only add what it omits.
