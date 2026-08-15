@@ -416,6 +416,33 @@ def extract_theorem_name(statement: str) -> str:
     return match.group(1) if match else ""
 
 
+def format_assert_statement(statement: str, name: str = "") -> str:
+    """
+    Build the `assert (<name>: <statement>)` tactic that introduces a helper lemma.
+
+    A missing or generic name is replaced by generate_helper_lemma_name().
+    """
+    name = name.strip()
+    if not name or name == 'H':
+        name = generate_helper_lemma_name(statement)
+    return f"assert ({name}: {statement.strip()})"
+
+
+_ASSERT_RE = re.compile(
+    r"^\s*assert\s*\(\s*([A-Za-z_][A-Za-z0-9_']*)\s*:\s*(.+)\)\s*\.?\s*$", re.DOTALL
+)
+
+
+def parse_assert_statement(assert_statement: str) -> tuple:
+    """
+    Split `assert (<name>: <statement>)` back into (name, statement).
+
+    Returns ('', '') when the tactic is not a named assert.
+    """
+    match = _ASSERT_RE.match(assert_statement)
+    return (match.group(1), match.group(2).strip()) if match else ("", "")
+
+
 # Coq built-in identifiers to filter out when extracting dependencies
 COQ_BUILTINS = {
     'forall', 'fun', 'Prop', 'Type', 'Z', 'Numbers', 'BinNums', 'Datatypes',
