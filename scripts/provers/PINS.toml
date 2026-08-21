@@ -1,0 +1,8 @@
+# Pinned Isabelle tooling for the LemmaNet proof agent.
+
+[isabelle]
+version = "Isabelle2025-2"
+
+[isabelle.mcp]
+package = "isabelle-mcp==0.3.1"
+repository = "https://github.com/xqyww123/Isabelle-MCP"
