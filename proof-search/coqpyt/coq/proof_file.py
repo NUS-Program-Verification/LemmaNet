@@ -16,17 +16,22 @@ from coqpyt.lsp.structs import (
     ResponseError,
     ErrorCodes,
 )
-from coqpyt.lsp.structs import Result, Query, Range, GoalAnswer, Position
-from coqpyt.lsp.client import CoqLspClient
+from coqpyt.coq.lsp.structs import Result, Query, Range, GoalAnswer, Position
+from coqpyt.coq.lsp.client import CoqLspClient
 from coqpyt.coq.structs import TermType, Step, Term, ProofStep, ProofTerm
 from coqpyt.coq.exceptions import *
 from coqpyt.coq.changes import *
+from coqpyt import __upstream_version__
 from coqpyt.coq.context import FileContext
 from coqpyt.coq.base_file import CoqFile
 
 
 class _AuxFile(object):
-    CACHE_NAME = "coqpyt_cache"
+    CACHE_FORMAT_VERSION = 4
+    CACHE_NAME = (
+        f"coqpyt_cache_{__upstream_version__}_v{CACHE_FORMAT_VERSION}"
+    )
+    LEGACY_CACHE_NAMES = ("coqpyt_cache",)
 
     def __init__(
         self,
@@ -200,7 +205,12 @@ class _AuxFile(object):
             home_dir = os.environ["USERPROFILE"]
         else:
             return None
-        cache_loc = os.path.join(home_dir, ".cache", cls.CACHE_NAME)
+        cache_root = os.path.join(home_dir, ".cache")
+        cache_loc = os.path.join(cache_root, cls.CACHE_NAME)
+        for legacy_name in cls.LEGACY_CACHE_NAMES:
+            legacy = os.path.join(cache_root, legacy_name)
+            if legacy != cache_loc and os.path.exists(legacy):
+                shutil.rmtree(legacy, ignore_errors=True)
         return cache_loc
 
     @classmethod
@@ -232,10 +242,16 @@ class _AuxFile(object):
         timeout: int,
         coq_lsp_options: Optional[Tuple[str, ...]] = None,
         workspace: Optional[str] = None,
+        cache_workspace: Optional[str] = None,
         use_disk_cache: bool = False,
     ) -> Dict[str, Term]:
         with open(library_file, "r") as f:
-            contents_to_hash = library_name + library_file + str(workspace) + f.read()
+            contents_to_hash = (
+                library_name
+                + library_file
+                + str(cache_workspace if cache_workspace is not None else workspace)
+                + f.read()
+            )
             library_hash = hashlib.md5(contents_to_hash.encode("utf-8")).hexdigest()
         if use_disk_cache:
             cached_library = cls.get_from_disk_cache(library_hash)
@@ -277,6 +293,7 @@ class _AuxFile(object):
     def get_coq_context(
         timeout: int,
         workspace: Optional[str] = None,
+        cache_workspace: Optional[str] = None,
         use_disk_cache: bool = False,
         coq_lsp_options: Optional[Tuple[str, ...]] = None,
     ) -> FileContext:
@@ -303,6 +320,7 @@ class _AuxFile(object):
                     v_file,
                     timeout,
                     workspace=workspace,
+                    cache_workspace=cache_workspace,
                     use_disk_cache=use_disk_cache,
                     coq_lsp_options=coq_lsp_options,
                 )
@@ -329,6 +347,7 @@ class ProofFile(CoqFile):
         coqtop: str = "coqtop",
         error_mode: str = "strict",
         use_disk_cache: bool = False,
+        cache_workspace: Optional[str] = None,
     ):
         """Creates a ProofFile.
 
@@ -373,6 +392,7 @@ class ProofFile(CoqFile):
         )
         self.__error_mode = error_mode
         self.__use_disk_cache = use_disk_cache
+        self.__cache_workspace = cache_workspace
         self.__aux_file.didOpen()
         self.__coq_lsp_options = coq_lsp_options
 
@@ -382,6 +402,7 @@ class ProofFile(CoqFile):
                 _AuxFile.get_coq_context(
                     self.timeout,
                     workspace=self.workspace,
+                    cache_workspace=self.__cache_workspace,
                     coq_lsp_options=coq_lsp_options,
                     use_disk_cache=self.__use_disk_cache,
                 )
@@ -463,15 +484,8 @@ class ProofFile(CoqFile):
 
     def __get_program_context(self) -> Tuple[Term, List[Term]]:
         expr = self.context.expr(self.prev_step)
-        # Tags:
-        # 0 - Obligation N of id : type
-        # 1 - Obligation N of id
-        # 2 - Obligation N : type
-        # 3 - Obligation N
-        # 4 - Next Obligation of id
-        # 5 - Next Obligation
         tag = self.context.ext_index(expr[1])
-        if tag in [0, 1, 4]:
+        if self.context.obligation_tag_with_id(tag):
             stack = expr[:0:-1]
             while len(stack) > 0:
                 el = stack.pop()
@@ -723,6 +737,7 @@ class ProofFile(CoqFile):
                 self.timeout,
                 self.__coq_lsp_options,
                 workspace=self.workspace,
+                cache_workspace=self.__cache_workspace,
                 use_disk_cache=self.__use_disk_cache,
             )
             self.context.add_library(library, library_terms)
@@ -1129,3 +1144,9 @@ class ProofFile(CoqFile):
     def close(self):
         super().close()
         self.__aux_file.close()
+
+    @staticmethod
+    def clear_disk_cache():
+        cache_loc = _AuxFile.get_coqpyt_disk_cache_loc()
+        if cache_loc is not None and os.path.exists(cache_loc):
+            shutil.rmtree(cache_loc, ignore_errors=True)

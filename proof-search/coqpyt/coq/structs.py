@@ -2,7 +2,7 @@ from enum import Enum
 from typing import Any, Optional, List, Union, Callable
 
 from coqpyt.lsp.structs import Diagnostic, Position
-from coqpyt.lsp.structs import RangedSpan, GoalAnswer
+from coqpyt.coq.lsp.structs import RangedSpan, GoalAnswer
 
 
 class SegmentType(Enum):

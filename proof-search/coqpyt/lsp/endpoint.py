@@ -31,15 +31,6 @@ class LspEndpoint(threading.Thread):
 
     def stop(self):
         self.shutdown_flag = True
-        
-        # Unblock all waiting cond var
-        for cond in list(self.event_dict.values()):
-            try:
-                cond.acquire()
-                cond.notify_all()
-                cond.release()
-            except:
-                pass
 
     def run(self):
         while not self.shutdown_flag:

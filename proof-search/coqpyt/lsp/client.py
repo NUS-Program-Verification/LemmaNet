@@ -147,8 +147,10 @@ class LspClient(object):
         )
         if isinstance(result_dict, list):
             return [
-                structs.Location(**l) if "uri" in l else structs.LinkLocation(**l)
-                for l in result_dict
+                structs.Location(**item)
+                if "uri" in item
+                else structs.LinkLocation(**item)
+                for item in result_dict
             ]
         if "uri" in result_dict:
             return [structs.Location(**result_dict)]
@@ -164,13 +166,16 @@ class LspClient(object):
         result_dict = self.lsp_endpoint.call_method(
             "textDocument/typeDefinition", textDocument=textDocument, position=position
         )
+        if isinstance(result_dict, list):
+            return [
+                structs.Location(**item)
+                if "uri" in item
+                else structs.LinkLocation(**item)
+                for item in result_dict
+            ]
         if "uri" in result_dict:
             return structs.Location(**result_dict)
-
-        return [
-            structs.Location(**l) if "uri" in l else structs.LinkLocation(**l)
-            for l in result_dict
-        ]
+        return structs.LinkLocation(**result_dict)
 
     def signatureHelp(self, textDocument, position):
         """
@@ -225,205 +230,3 @@ class LspClient(object):
             structs.Location(**l) if "uri" in l else structs.LinkLocation(**l)
             for l in result_dict
         ]
-
-# Coq-specific LSP client
-import sys
-import threading
-import subprocess
-from typing import Tuple, Dict, List, Optional
-from coqpyt.lsp.structs import *
-from coqpyt.lsp.json_rpc_endpoint import JsonRpcEndpoint
-
-
-class CoqLspClient(LspClient):
-    """Abstraction to interact with coq-lsp
-
-    Attributes:
-        file_progress (Dict[str, List[CoqFileProgressParams]]): Contains all
-            the `$/coq/fileProgress` notifications sent by the server. The
-            keys are the URIs of the files and the values are the list of
-            notifications.
-    """
-
-    __DEFAULT_INIT_OPTIONS = {
-        "max_errors": 120000000,
-        "goal_after_tactic": False,
-        "show_coq_info_messages": True,
-    }
-
-    def __init__(
-        self,
-        root_uri: str,
-        timeout: int = 30,
-        memory_limit: int = 2097152,
-        coq_lsp: str = "coq-lsp",
-        coq_lsp_options: Optional[Tuple[str, ...]] = None,
-        init_options: Dict = __DEFAULT_INIT_OPTIONS,
-    ):
-        """Creates a CoqLspClient
-
-        Args:
-            root_uri (str): URI to the workspace where coq-lsp will run
-                The URI can be either a file or a folder.
-            timeout (int, optional): Timeout used for the coq-lsp operations.
-                Defaults to 2.
-            memory_limit (int, optional): RAM limit for the coq-lsp process
-                in kbytes. It only works for Linux systems. Defaults to 2097152.
-            coq_lsp(str, optional): Path to the coq-lsp binary. Defaults to "coq-lsp".
-            init_options (Dict, optional): Initialization options for coq-lsp server.
-                Available options are:
-                    max_errors (int): Maximum number of errors per file, after that,
-                        coq-lsp will stop checking the file. Defaults to 120000000.
-                    show_coq_info_messages (bool): Show Coq's info messages as diagnostics.
-                        Defaults to false.
-                    show_notices_as_diagnostics (bool): Show Coq's notice messages
-                        as diagnostics, such as `About` and `Search` operations.
-                        Defaults to false.
-                    debug (bool): Enable Debug in Coq Server. Defaults to false.
-                    pp_type (int): Method to print Coq Terms.
-                        0 = Print to string
-                        1 = Use jsCoq's Pp rich layout printer
-                        2 = Coq Layout Engine
-                        Defaults to 1.
-        """
-        self.file_progress: Dict[str, List[CoqFileProgressParams]] = {}
-
-        if sys.platform.startswith("linux"):
-            command = f"ulimit -v {memory_limit}; {coq_lsp}"
-        else:
-            command = f"{coq_lsp}"
-
-        if coq_lsp_options is None:
-            command += " -D 0"
-        else:
-            hasDOption = False
-            for option in coq_lsp_options:
-                if option.startswith("-D"):
-                    hasDOption = True
-                    break
-            if not hasDOption:
-                command += " -D 0"
-            command += " " + " ".join(coq_lsp_options)
-
-        proc = subprocess.Popen(
-            command,
-            stdout=subprocess.PIPE,
-            stdin=subprocess.PIPE,
-            shell=True,
-        )
-        json_rpc_endpoint = JsonRpcEndpoint(proc.stdin, proc.stdout)
-        lsp_endpoint = LspEndpoint(json_rpc_endpoint, timeout=timeout)
-        lsp_endpoint.notify_callbacks = {
-            "$/coq/fileProgress": self.__handle_file_progress,
-            "textDocument/publishDiagnostics": self.__handle_publish_diagnostics,
-        }
-        super().__init__(lsp_endpoint)
-        workspaces = [{"name": "coq-lsp", "uri": root_uri}]
-        # This is required to be False since we use it to know if operations
-        # such as didOpen and didChange already finished.
-        init_options["eager_diagnostics"] = False
-        self.initialize(
-            proc.pid,
-            "",
-            root_uri,
-            init_options,
-            {},
-            "off",
-            workspaces,
-        )
-        self.initialized()
-        # Used to check if didOpen and didChange already finished
-        self.__completed_operation = threading.Event()
-
-    def __handle_publish_diagnostics(self, params: Dict):
-        self.__completed_operation.set()
-
-    def __handle_file_progress(self, params: Dict):
-        coq_file_progress = CoqFileProgressParams.parse(params)
-        if coq_file_progress is None:
-            return
-
-        uri = coq_file_progress.textDocument.uri
-        if uri not in self.file_progress:
-            self.file_progress[uri] = [coq_file_progress]
-        else:
-            self.file_progress[uri].append(coq_file_progress)
-
-    def __wait_for_operation(self):
-        timeout = not self.__completed_operation.wait(self.lsp_endpoint.timeout)
-        self.__completed_operation.clear()
-        if self.lsp_endpoint.shutdown_flag:
-            raise ResponseError(ErrorCodes.ServerQuit, "Server quit")
-        if timeout:
-            self.shutdown()
-            self.exit()
-            raise ResponseError(ErrorCodes.ServerTimeout, "Server timeout")
-
-    def didOpen(self, textDocument: TextDocumentItem):
-        """Open a text document in the server.
-
-        Args:
-            textDocument (TextDocumentItem): Text document to open
-        """
-        self.lsp_endpoint.diagnostics[textDocument.uri] = []
-        super().didOpen(textDocument)
-        self.__wait_for_operation()
-
-    def didChange(
-        self,
-        textDocument: VersionedTextDocumentIdentifier,
-        contentChanges: list[TextDocumentContentChangeEvent],
-    ):
-        """Submit changes on a text document already open on the server.
-
-        Args:
-            textDocument (VersionedTextDocumentIdentifier): Text document changed.
-            contentChanges (list[TextDocumentContentChangeEvent]): Changes made.
-        """
-        self.lsp_endpoint.diagnostics[textDocument.uri] = []
-        super().didChange(textDocument, contentChanges)
-        self.__wait_for_operation()
-
-    def proof_goals(
-        self, textDocument: TextDocumentIdentifier, position: Position
-    ) -> Optional[GoalAnswer]:
-        """Get proof goals and relevant information at a position.
-
-        Args:
-            textDocument (TextDocumentIdentifier): Text document to consider.
-            position (Position): Position used to get the proof goals.
-
-        Returns:
-            GoalAnswer: Contains the goals at a position, messages associated
-                to the position and if errors exist, the top error at the position.
-        """
-        result_dict = self.lsp_endpoint.call_method(
-            "proof/goals", textDocument=textDocument, position=position
-        )
-        return GoalAnswer.parse(result_dict)
-
-    def get_document(
-        self, textDocument: TextDocumentIdentifier
-    ) -> Optional[FlecheDocument]:
-        """Get the AST of a text document.
-
-        Args:
-            textDocument (TextDocumentIdentifier): Text document
-
-        Returns:
-            Optional[FlecheDocument]: Serialized version of Fleche's document
-        """
-        result_dict = self.lsp_endpoint.call_method(
-            "coq/getDocument", textDocument=textDocument
-        )
-        return FlecheDocument.parse(result_dict)
-
-    def save_vo(self, textDocument: TextDocumentIdentifier):
-        """Save a compiled file to disk.
-
-        Args:
-            textDocument (TextDocumentIdentifier): File to be saved.
-                The uri in the textDocument should contain an absolute path.
-        """
-        self.lsp_endpoint.call_method("coq/saveVo", textDocument=textDocument)
-    # TODO: handle performance data notification?
