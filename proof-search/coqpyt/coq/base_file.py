@@ -14,8 +14,8 @@ from coqpyt.lsp.structs import (
     ErrorCodes,
     Diagnostic,
 )
-from coqpyt.lsp.structs import Position, RangedSpan, Range
-from coqpyt.lsp.client import CoqLspClient
+from coqpyt.coq.lsp.structs import Position, RangedSpan, Range
+from coqpyt.coq.lsp.client import CoqLspClient
 from coqpyt.coq.exceptions import *
 from coqpyt.coq.changes import *
 from coqpyt.coq.structs import Step
@@ -97,7 +97,7 @@ class CoqFile(object):
 
     def __init_path(self, file_path, library):
         self.file_module = [] if library is None else library.split(".")
-        self.__from_lib = self.file_module[:2] == ["Coq", "Init"]
+        self.__from_lib = self.file_module[:2] in [["Coq", "Init"], ["Corelib", "Init"]]
         self.path = file_path
         if not self.__from_lib:
             self._path = file_path

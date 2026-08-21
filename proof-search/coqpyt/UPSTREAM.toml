@@ -1,0 +1,15 @@
+[upstream]
+name = "CoqPyt"
+repository = "https://github.com/sr-lab/coqpyt.git"
+tag = "v1.1.0"
+commit = "f47237a3cdb8d0d9d6d3195971d529f5750fdf02"
+
+[vendoring]
+version = "1.1.0+lemmanet.2"
+production_source = "coqpyt/"
+local_patches = [
+  "stable project cache identity for isolated backend workspaces",
+  "versioned cache namespace and legacy cache removal",
+  "goal-state cache invalidation from LemmaNet upstream d563746",
+  "defensive Rocq indexing and LSP parsing from LemmaNet upstream d563746",
+]
