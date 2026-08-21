@@ -1,0 +1,10 @@
+# Pinned Lean tooling for the LemmaNet proof agent.
+
+[lean]
+toolchain = "leanprover/lean4:v4.21.0"
+mathlib = "308445d7985027f538e281e18df29ca16ede2ba3"
+
+[lean.repl]
+repository = "https://github.com/leanprover-community/repl"
+branch = "bump_to_v4.21.0"
+commit = "b4967b310e5f776a73e992f936224f9e4028f0d7"
