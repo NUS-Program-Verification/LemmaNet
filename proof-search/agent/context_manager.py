@@ -801,11 +801,6 @@ class ContextManager:
             self.logger.error(f"Error executing context search: {e}")
             return f"Context search error: {str(e)}"
     
-    def should_give_up(self) -> bool:
-        """Determine if the agent should give up on the proof."""
-        give_up_keywords = ["unprovable", "not provable", "unable to proceed", "give up", "abort"]
-        return any([kw in self.chat_session.current_plan.lower() for kw in give_up_keywords])
-
     def get_similar_history(self, proof_state: str, n: int = 5) -> List[Dict[str, str]]:
         try:
             return self.tactic_history.get_similar_history(proof_state, n)

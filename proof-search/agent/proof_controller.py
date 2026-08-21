@@ -360,12 +360,14 @@ class ProofController:
         consecutive_queries = 0
         consecutive_errors = 0
         error_tactics = []
+        abort_pending = False  # set by a first 'Abort.'; a second one confirms giving up
 
         def _clear_error_tracking():
-            nonlocal consecutive_queries, consecutive_errors, error_tactics
+            nonlocal consecutive_queries, consecutive_errors, error_tactics, abort_pending
             consecutive_queries = 0
             consecutive_errors = 0
             error_tactics.clear()
+            abort_pending = False
 
         tool_call_id = None
         last_tool_success = False
@@ -422,10 +424,6 @@ class ProofController:
                 last_tool_success = True
                 prompt = self.context_manager.handle_plan_call(decision_content, tool_call_id)
                 print(visualizer.render_action('plan', decision_content))
-                if self.context_manager.should_give_up():
-                    self.logger.warning(f"⚠️  Step {self.global_step_id}: PROOF UNPROVABLE -- giving up!")
-                    self.give_up = True
-                    break
                 self.logger.info(f"✅ Step {self.global_step_id}: PLAN FUNCTION CALLED!")
                 continue  # plan is transparent
 
@@ -561,9 +559,20 @@ class ProofController:
                     consecutive_errors += 1
                     continue
 
-                # Early abort: give up
+                # Early abort: first 'Abort.' asks for confirmation, second one gives up
                 if tactic_content in ["Abort.", "abort.", ]:
-                    self.logger.warning(f"⚠️  Step {self.global_step_id}: ABORTING PROOF -- giving up!")
+                    if not abort_pending:
+                        abort_pending = True
+                        self.gen_step_count -= 1
+                        prompt = (
+                            "You have requested to abort the proof. If the goal is truly unprovable or you see no way "
+                            "forward, reply with the 'tactic' 'Abort.' once more to give up permanently. "
+                            "Otherwise, suggest a *different* tactic, review your plan, query for relevant terms, "
+                            "or roll back to an earlier state.\n"
+                        )
+                        self.logger.warning(f"⚠️  Step {self.global_step_id}: ABORT REQUESTED -- confirmation needed!")
+                        continue
+                    self.logger.warning(f"⚠️  Step {self.global_step_id}: ABORT CONFIRMED -- giving up!")
                     self.give_up = True
                     break
 
